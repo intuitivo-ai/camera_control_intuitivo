@@ -13,7 +13,7 @@ defmodule CameraControl.Nif do
   Starts a camera and links it to the target PID.
   Returns `{:ok, resource}` or `{:error, reason}`.
   """
-  def start_camera(_id, _board_id, _path, _width, _height, _fps, _target_pid) do
+  def start_camera(_id, _board_id, _path, _card_type, _width, _height, _fps, _target_pid) do
     :erlang.nif_error(:nif_not_loaded)
   end
 

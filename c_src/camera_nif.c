@@ -13,6 +13,7 @@ typedef struct {
     int camera_id;
     char camera_path[64];
     char board_id[32];
+    char card_type[64];
     int fd;
     GstElement *pipeline;
     ErlNifPid target_pid;
@@ -134,8 +135,23 @@ static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
         if (new_exp_time != state->current_exp_time_us) {
             state->current_exp_time_us = new_exp_time;
             int exp_to_apply = new_exp_time;
-            // USB camera heuristic like python
-            if (strstr(state->camera_path, "usb")) {
+            
+            // Convert card_type to lowercase for comparison, similar to Python
+            char card_lower[64];
+            int is_usb_cam = 0;
+            if (strlen(state->card_type) > 0) {
+                for (size_t i = 0; state->card_type[i]; i++) {
+                    card_lower[i] = tolower((unsigned char)state->card_type[i]);
+                }
+                card_lower[strlen(state->card_type)] = '\0';
+                
+                if (strstr(card_lower, "usb live camera") != NULL || 
+                    strstr(card_lower, "gbx usb live") != NULL) {
+                    is_usb_cam = 1;
+                }
+            }
+
+            if (is_usb_cam) {
                 exp_to_apply = new_exp_time / 9.5;
             } else {
                 exp_to_apply = (new_exp_time / 1000.0) / 0.1;
@@ -157,20 +173,22 @@ static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
 }
 
 static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    if (argc != 7) return enif_make_badarg(env);
+    if (argc != 8) return enif_make_badarg(env);
 
     int camera_id, fw, fh, fps;
     char board_id[32];
     char camera_path[64];
+    char card_type[64];
     ErlNifPid target_pid;
 
     if (!enif_get_int(env, argv[0], &camera_id) ||
         !enif_get_string(env, argv[1], board_id, sizeof(board_id), ERL_NIF_LATIN1) ||
         !enif_get_string(env, argv[2], camera_path, sizeof(camera_path), ERL_NIF_LATIN1) ||
-        !enif_get_int(env, argv[3], &fw) ||
-        !enif_get_int(env, argv[4], &fh) ||
-        !enif_get_int(env, argv[5], &fps) ||
-        !enif_get_local_pid(env, argv[6], &target_pid)) {
+        !enif_get_string(env, argv[3], card_type, sizeof(card_type), ERL_NIF_LATIN1) ||
+        !enif_get_int(env, argv[4], &fw) ||
+        !enif_get_int(env, argv[5], &fh) ||
+        !enif_get_int(env, argv[6], &fps) ||
+        !enif_get_local_pid(env, argv[7], &target_pid)) {
         return enif_make_badarg(env);
     }
 
@@ -180,17 +198,43 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     state->camera_id = camera_id;
     strncpy(state->board_id, board_id, sizeof(state->board_id));
     strncpy(state->camera_path, camera_path, sizeof(state->camera_path));
+    strncpy(state->card_type, card_type, sizeof(state->card_type));
     state->target_pid = target_pid;
     
-    // Default AE settings
-    state->target_intensity = 0.3;
-    state->max_exp_time_us = 1100;
-    state->min_exp_time_us = 100;
-    state->max_gain = 24;
-    state->min_gain = 0;
-    state->gain_change_step = 1;
-    state->dec_gain_exp_us = 350;
-    state->inc_gain_exp_us = 950;
+    // Check if USB camera for default values
+    char card_lower[64];
+    int is_usb = 0;
+    if (strlen(state->card_type) > 0) {
+        for (size_t i = 0; state->card_type[i]; i++) {
+            card_lower[i] = tolower((unsigned char)state->card_type[i]);
+        }
+        card_lower[strlen(state->card_type)] = '\0';
+        
+        if (strstr(card_lower, "usb live camera") != NULL || 
+            strstr(card_lower, "gbx usb live") != NULL) {
+            is_usb = 1;
+        }
+    }
+    
+    if (is_usb) {
+        state->target_intensity = 0.3;
+        state->max_exp_time_us = 3000;
+        state->min_exp_time_us = 100;
+        state->max_gain = 300;
+        state->min_gain = 64;
+        state->gain_change_step = 20;
+        state->dec_gain_exp_us = 250;
+        state->inc_gain_exp_us = 2950;
+    } else {
+        state->target_intensity = 0.3;
+        state->max_exp_time_us = 1100;
+        state->min_exp_time_us = 100;
+        state->max_gain = 24;
+        state->min_gain = 0;
+        state->gain_change_step = 1;
+        state->dec_gain_exp_us = 350;
+        state->inc_gain_exp_us = 950;
+    }
     state->current_exp_time_us = 1400;
     state->current_gain_x = 1;
     state->last_time_ns = g_get_monotonic_time();
@@ -206,12 +250,22 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
         set_v4l2_ctrl(state->fd, V4L2_CID_FOCUS_AUTO, 0);
     }
     
-    char pipeline_str[1024];
-    snprintf(pipeline_str, sizeof(pipeline_str),
-        "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
-        "t. ! queue ! appsink name=jpeg_sink drop=true max-buffers=2 "
-        "t. ! queue ! videorate ! video/x-raw,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1",
-        camera_path, fw, fh, fps);
+    char pipeline_str[2048];
+    if (strcmp(board_id, "rpi4") == 0) {
+        snprintf(pipeline_str, sizeof(pipeline_str),
+            "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
+            "t. ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! gdppay ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! tcpserversink host=127.0.0.1 port=%d "
+            "t. ! queue ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
+            "t. ! queue ! videorate ! video/x-raw,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
+            camera_path, fw, fh, fps, 5000 + camera_id);
+    } else {
+        snprintf(pipeline_str, sizeof(pipeline_str),
+            "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
+            "t. ! queue max-size-buffers=200 max-size-bytes=52428800 max-size-time=5000000000 leaky=downstream ! gdppay ! queue max-size-buffers=200 leaky=downstream ! tcpserversink host=127.0.0.1 port=%d sync-method=latest-keyframe recover-policy=keyframe "
+            "t. ! queue max-size-buffers=2 leaky=downstream ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
+            "t. ! queue max-size-buffers=2 leaky=downstream ! videorate ! video/x-raw,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
+            camera_path, fw, fh, fps, 5000 + camera_id);
+    }
         
     GError *error = NULL;
     state->pipeline = gst_parse_launch(pipeline_str, &error);
@@ -282,7 +336,7 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
 }
 
 static ErlNifFunc nif_funcs[] = {
-    {"start_camera", 7, start_camera, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"start_camera", 8, start_camera, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"stop_camera", 1, stop_camera, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 

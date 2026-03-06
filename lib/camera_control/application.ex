@@ -5,6 +5,7 @@ defmodule CameraControl.Application do
   def start(_type, _args) do
     children = [
       {Registry, keys: :unique, name: CameraControl.Registry},
+      {DynamicSupervisor, name: CameraControl.CameraSupervisor, strategy: :one_for_one},
       {Bandit, plug: CameraControl.HttpStream, port: 11000}
     ]
 
