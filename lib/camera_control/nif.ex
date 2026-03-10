@@ -6,7 +6,29 @@ defmodule CameraControl.Nif do
 
   def load_nif do
     nif_file = :code.priv_dir(:camera_control) |> Path.join("camera_nif")
-    :erlang.load_nif(to_charlist(nif_file), 0)
+    
+    case :erlang.load_nif(to_charlist(nif_file), 0) do
+      :ok ->
+        :ok
+
+      {:error, {:load_failed, _}} = error ->
+        # In Nerves, the host (x86_64) compiles the code but cannot load the target (ARM) NIF.
+        # This is expected during cross-compilation. We return :ok to suppress the warning.
+        # The NIF will load successfully when the code runs on the actual target device.
+        if is_cross_compiling?() do
+          :ok
+        else
+          error
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp is_cross_compiling? do
+    # A simple heuristic: if we are building for Nerves, MIX_TARGET is usually set to something other than "host"
+    System.get_env("MIX_TARGET") not in [nil, "host"]
   end
 
   @doc """
