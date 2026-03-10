@@ -12,13 +12,32 @@ defmodule CameraControl do
     recording: false,
     recording_base: nil,
     exposure_data: [],
-    exposure_counter: 0
+    exposure_counter: 0,
+    last_applied_exp: 0,
+    last_applied_gain: -1,
+    controls_initialized: false
   ]
+
+  @device_retry_delay_ms 2_000
+  @device_max_retries 5
+  @base_backoff_ms 3_000
+  @max_backoff_ms 30_000
+  @max_rapid_crashes 8
+  @crash_window_ms 120_000
 
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
     name = via_tuple(id)
     GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  def child_spec(opts) do
+    id = Keyword.fetch!(opts, :id)
+    %{
+      id: {__MODULE__, id},
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :transient
+    }
   end
 
   def via_tuple(id), do: {:via, Registry, {CameraControl.Registry, "camera_#{id}"}}
@@ -48,56 +67,77 @@ defmodule CameraControl do
     GenServer.cast(via_tuple(id), :stop_recording)
   end
 
+  def reset_crash_count(id) do
+    try do
+      :ets.delete(:camera_crash_tracker, id)
+    catch
+      _, _ -> :ok
+    end
+  end
+
   @impl true
   def init(opts) do
     id = Keyword.fetch!(opts, :id)
     board_id = Keyword.get(opts, :board_id, "rpi4")
-    
-    # Resolve device path dynamically like the python script
-    {path, card_type} = case CameraControl.DeviceFinder.get_device_path(id, board_id) do
-      {p, c} -> {p, c}
-      p when is_binary(p) -> {p, ""}
-      _ -> {nil, ""}
-    end
 
-    if is_nil(path) do
-      Logger.error("Failed to find device path for camera #{id}")
-      # Return ignore or error so supervisor keeps trying
-      {:stop, :device_not_found}
+    crash_count = recent_crash_count(id)
+
+    if crash_count >= @max_rapid_crashes do
+      Logger.error("Camera #{id}: #{crash_count} crashes in #{div(@crash_window_ms, 1000)}s. Giving up.")
+      {:stop, :normal}
     else
-      width = Keyword.get(opts, :width, 1280)
-      height = Keyword.get(opts, :height, 720)
-      fps = Keyword.get(opts, :fps, 30)
-
-      # Get initial inode to detect device reconnection
-      inode = case File.stat(path) do
-        {:ok, stat} -> stat.inode
-        _ -> nil
+      if crash_count > 0 do
+        backoff = min(@max_backoff_ms, @base_backoff_ms * round(:math.pow(2, min(crash_count - 1, 4))))
+        Logger.info("Camera #{id}: backoff #{backoff}ms after #{crash_count} recent crash(es)")
+        Process.sleep(backoff)
       end
 
-      case Nif.start_camera(id, board_id, path, card_type, width, height, fps, self()) do
-        {:ok, resource} ->
-          Logger.info("Camera #{id} started successfully at #{path} (#{card_type})")
-          
-          # Start watchdog timer
-          Process.send_after(self(), :watchdog_check, 1000)
+      {path, card_type} = find_device_with_retries(id, board_id, @device_max_retries)
 
-          {:ok, %__MODULE__{
-            id: id,
-            board_id: board_id,
-            path: path,
-            card_type: card_type,
-            width: width,
-            height: height,
-            fps: fps,
-            resource: resource,
-            device_inode: inode,
-            last_frame_time: System.monotonic_time(:millisecond)
-          }}
+      cond do
+        is_nil(path) ->
+          Logger.error("Failed to find device path for camera #{id} after #{@device_max_retries} retries")
+          record_crash(id)
+          {:stop, :device_not_found}
 
-        {:error, reason} ->
-          Logger.error("Failed to start camera #{id} at #{path}: #{inspect(reason)}")
-          {:stop, reason}
+        not wait_device_ready(path, id) ->
+          Logger.error("Camera #{id}: device #{path} never became ready")
+          record_crash(id)
+          {:stop, :device_not_ready}
+
+        true ->
+          width = Keyword.get(opts, :width, 1280)
+          height = Keyword.get(opts, :height, 720)
+          fps = Keyword.get(opts, :fps, 30)
+
+          inode = case File.stat(path) do
+            {:ok, stat} -> stat.inode
+            _ -> nil
+          end
+
+          case Nif.start_camera(id, board_id, path, card_type, width, height, fps, self()) do
+            {:ok, resource} ->
+              Logger.info("Camera #{id} started successfully at #{path} (#{card_type})")
+              Process.send_after(self(), :watchdog_check, 2000)
+
+              {:ok, %__MODULE__{
+                id: id,
+                board_id: board_id,
+                path: path,
+                card_type: card_type,
+                width: width,
+                height: height,
+                fps: fps,
+                resource: resource,
+                device_inode: inode,
+                last_frame_time: System.monotonic_time(:millisecond)
+              }}
+
+            {:error, reason} ->
+              Logger.error("Failed to start camera #{id} at #{path}: #{inspect(reason)}")
+              record_crash(id)
+              {:stop, reason}
+          end
       end
     end
   end
@@ -111,6 +151,11 @@ defmodule CameraControl do
   @impl true
   def handle_call(:get_frame, _from, state) do
     {:reply, state.frame, state}
+  end
+
+  @impl true
+  def handle_call(:alive?, _from, state) do
+    {:reply, state.resource != nil, state}
   end
 
   @impl true
@@ -144,11 +189,24 @@ defmodule CameraControl do
     Enum.each(state.subscribers, fn pid ->
       send(pid, {:jpeg_frame, id, frame_data})
     end)
+
+    state =
+      if not state.controls_initialized do
+        Logger.info("Camera #{id}: first frame received, initializing V4L2 controls")
+        CameraControl.V4L2.init_controls(state.path, state.board_id, state.card_type)
+        %{state | controls_initialized: true}
+      else
+        state
+      end
+
+    clear_crash_history_on_success(id)
     {:noreply, %{state | frame: frame_data, last_frame_time: System.monotonic_time(:millisecond)}}
   end
 
   @impl true
   def handle_info({:ae_data, id, exp_time, gain, mean_intensity}, %{id: id} = state) do
+    state = apply_ae_controls(state, exp_time, gain)
+
     if state.recording do
       counter = state.exposure_counter + 1
       entry = {counter, exp_time, gain, mean_intensity}
@@ -163,12 +221,10 @@ defmodule CameraControl do
     current_time = System.monotonic_time(:millisecond)
     time_since_last_frame = current_time - state.last_frame_time
 
-    # 1. Check if frame is stuck (> 4000ms)
     if time_since_last_frame > 4000 do
       Logger.error("CameraControl watchdog: frame timeout on camera #{state.id}. Restarting.")
       {:stop, :frame_timeout, state}
     else
-      # 2. Check if device inode changed (USB disconnect/reconnect)
       case File.stat(state.path) do
         {:ok, stat} ->
           if stat.inode != state.device_inode do
@@ -188,6 +244,84 @@ defmodule CameraControl do
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     {:noreply, %{state | subscribers: List.delete(state.subscribers, pid)}}
+  end
+
+  defp apply_ae_controls(state, exp_time, gain) do
+    exp_changed = exp_time != state.last_applied_exp
+    gain_changed = gain != state.last_applied_gain
+
+    if exp_changed do
+      CameraControl.V4L2.apply_exposure(state.path, state.board_id, state.card_type, exp_time)
+    end
+
+    if gain_changed do
+      CameraControl.V4L2.apply_gain(state.path, state.board_id, gain)
+    end
+
+    %{state | last_applied_exp: exp_time, last_applied_gain: gain}
+  end
+
+  defp wait_device_ready(path, id, attempts \\ 5)
+  defp wait_device_ready(_path, _id, 0), do: false
+
+  defp wait_device_ready(path, id, attempts) do
+    case System.cmd("v4l2-ctl", ["--device", path, "--get-fmt-video"], stderr_to_stdout: true) do
+      {_output, 0} ->
+        true
+
+      _ ->
+        Logger.info("Camera #{id}: #{path} not ready, waiting 500ms (#{attempts - 1} left)...")
+        Process.sleep(500)
+        wait_device_ready(path, id, attempts - 1)
+    end
+  end
+
+  defp find_device_with_retries(_id, _board_id, 0), do: {nil, ""}
+
+  defp find_device_with_retries(id, board_id, retries_left) do
+    case CameraControl.DeviceFinder.get_device_path(id, board_id) do
+      {p, c} ->
+        {p, c}
+
+      _ ->
+        Logger.info("Camera #{id}: device not found, retrying in #{@device_retry_delay_ms}ms (#{retries_left - 1} left)...")
+        Process.sleep(@device_retry_delay_ms)
+        find_device_with_retries(id, board_id, retries_left - 1)
+    end
+  end
+
+  defp record_crash(id) do
+    now = System.monotonic_time(:millisecond)
+    timestamps = case :ets.lookup(:camera_crash_tracker, id) do
+      [{^id, ts}] -> ts
+      _ -> []
+    end
+    cutoff = now - @crash_window_ms
+    updated = [now | Enum.filter(timestamps, &(&1 > cutoff))]
+    :ets.insert(:camera_crash_tracker, {id, updated})
+  rescue
+    _ -> :ok
+  end
+
+  defp recent_crash_count(id) do
+    now = System.monotonic_time(:millisecond)
+    cutoff = now - @crash_window_ms
+    case :ets.lookup(:camera_crash_tracker, id) do
+      [{^id, timestamps}] ->
+        Enum.count(timestamps, &(&1 > cutoff))
+      _ ->
+        0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp clear_crash_history_on_success(id) do
+    try do
+      :ets.delete(:camera_crash_tracker, id)
+    catch
+      _, _ -> :ok
+    end
   end
 
   defp save_exposure_log(state) do
@@ -213,6 +347,7 @@ defmodule CameraControl do
       save_exposure_log(state)
     end
     Nif.stop_camera(resource)
+    record_crash(state.id)
     Logger.info("Camera #{state.id} terminated: #{inspect(reason)}")
   end
   def terminate(_reason, _state), do: :ok

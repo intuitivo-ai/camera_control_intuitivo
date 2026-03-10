@@ -1,10 +1,6 @@
 #include <erl_nif.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
-#include <linux/videodev2.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -15,7 +11,6 @@ typedef struct {
     char camera_path[64];
     char board_id[32];
     char card_type[64];
-    int fd;
     GstElement *pipeline;
     ErlNifPid target_pid;
     
@@ -38,16 +33,6 @@ typedef struct {
 } CameraState;
 
 static ErlNifResourceType* camera_state_type = NULL;
-
-static void set_v4l2_ctrl(int fd, int ctrl_id, int value) {
-    if (fd < 0) return;
-    struct v4l2_control ctrl;
-    ctrl.id = ctrl_id;
-    ctrl.value = value;
-    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) == -1) {
-        // Handle error silently or log
-    }
-}
 
 static GstFlowReturn on_new_jpeg_sample(GstAppSink *sink, gpointer user_data) {
     CameraState *state = (CameraState *)user_data;
@@ -146,26 +131,10 @@ static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
             if (new_gain < state->min_gain) new_gain = state->min_gain;
         }
 
-        int apply_exp = (new_exp_time != state->current_exp_time_us);
-        int apply_gain = (new_gain != state->current_gain_x);
         state->current_exp_time_us = new_exp_time;
         state->current_gain_x = new_gain;
 
         enif_mutex_unlock(state->lock);
-
-        if (apply_exp) {
-            int exp_to_apply;
-            if (is_usb_camera(state->card_type)) {
-                exp_to_apply = (int)(new_exp_time / 9.5);
-            } else {
-                exp_to_apply = (int)((new_exp_time / 1000.0) / 0.1);
-            }
-            set_v4l2_ctrl(state->fd, V4L2_CID_EXPOSURE_ABSOLUTE, exp_to_apply);
-        }
-
-        if (apply_gain) {
-            set_v4l2_ctrl(state->fd, V4L2_CID_GAIN, new_gain);
-        }
 
         {
             ErlNifEnv *msg_env = enif_alloc_env();
@@ -244,14 +213,6 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     state->current_exp_time_us = 1400;
     state->current_gain_x = 1;
     state->last_time_us = g_get_monotonic_time();
-    state->fd = -1;
-
-    state->fd = open(state->camera_path, O_RDWR);
-    if (state->fd >= 0) {
-        set_v4l2_ctrl(state->fd, V4L2_CID_EXPOSURE_AUTO, 1);
-        set_v4l2_ctrl(state->fd, V4L2_CID_POWER_LINE_FREQUENCY, 2);
-        set_v4l2_ctrl(state->fd, V4L2_CID_FOCUS_AUTO, 0);
-    }
 
     char pipeline_str[2048];
     if (strcmp(board_id, "rpi4") == 0) {
@@ -275,7 +236,6 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     if (error) {
         fprintf(stderr, "Failed to parse pipeline: %s\n", error->message);
         g_error_free(error);
-        if (state->fd >= 0) close(state->fd);
         enif_mutex_destroy(state->lock);
         enif_release_resource(state);
         return enif_make_tuple2(env, enif_make_atom(env, "error"),
@@ -292,7 +252,18 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     g_signal_connect(gray_sink, "new-sample", G_CALLBACK(on_new_gray_sample), state);
     gst_object_unref(gray_sink);
 
-    gst_element_set_state(state->pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(state->pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        fprintf(stderr, "Camera %d: pipeline failed to start\n", camera_id);
+        gst_object_unref(state->pipeline);
+        state->pipeline = NULL;
+        enif_mutex_destroy(state->lock);
+        enif_release_resource(state);
+        return enif_make_tuple2(env, enif_make_atom(env, "error"),
+            enif_make_string(env, "pipeline_start_failed", ERL_NIF_LATIN1));
+    }
+
+    gst_element_get_state(state->pipeline, NULL, NULL, 2 * GST_SECOND);
 
     ERL_NIF_TERM resource_term = enif_make_resource(env, state);
     enif_release_resource(state);
@@ -350,10 +321,6 @@ static ERL_NIF_TERM stop_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
         gst_object_unref(state->pipeline);
         state->pipeline = NULL;
     }
-    if (state->fd >= 0) {
-        close(state->fd);
-        state->fd = -1;
-    }
 
     return enif_make_atom(env, "ok");
 }
@@ -364,10 +331,6 @@ static void camera_state_dtor(ErlNifEnv* env, void* obj) {
         gst_element_set_state(state->pipeline, GST_STATE_NULL);
         gst_object_unref(state->pipeline);
         state->pipeline = NULL;
-    }
-    if (state->fd >= 0) {
-        close(state->fd);
-        state->fd = -1;
     }
     if (state->lock) {
         enif_mutex_destroy(state->lock);
