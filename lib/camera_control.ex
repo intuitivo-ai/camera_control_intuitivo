@@ -118,7 +118,7 @@ defmodule CameraControl do
           case Nif.start_camera(id, board_id, path, card_type, width, height, fps, self()) do
             {:ok, resource} ->
               Logger.info("Camera #{id} started successfully at #{path} (#{card_type})")
-              Process.send_after(self(), :watchdog_check, 2000)
+              Process.send_after(self(), :watchdog_check, 4000)
 
               {:ok, %__MODULE__{
                 id: id,
@@ -221,22 +221,25 @@ defmodule CameraControl do
     current_time = System.monotonic_time(:millisecond)
     time_since_last_frame = current_time - state.last_frame_time
 
-    if time_since_last_frame > 4000 do
+    # Increase timeout to 8000ms. Some cameras take longer to negotiate UVC
+    # and start streaming their first frame after being opened by GStreamer.
+    if time_since_last_frame > 12000 do
       Logger.error("CameraControl watchdog: frame timeout on camera #{state.id}. Restarting.")
-      {:stop, :frame_timeout, state}
+      # Exit with an error tuple so the :transient supervisor restarts us
+      exit({:shutdown, :frame_timeout})
     else
       case File.stat(state.path) do
         {:ok, stat} ->
           if stat.inode != state.device_inode do
             Logger.error("CameraControl watchdog: device inode changed on camera #{state.id}. Restarting.")
-            {:stop, :device_changed, state}
+            exit({:shutdown, :device_changed})
           else
             Process.send_after(self(), :watchdog_check, 1000)
             {:noreply, state}
           end
         _ ->
           Logger.error("CameraControl watchdog: device gone on camera #{state.id}. Restarting.")
-          {:stop, :device_gone, state}
+          exit({:shutdown, :device_gone})
       end
     end
   end
