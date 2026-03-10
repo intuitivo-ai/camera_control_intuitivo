@@ -14,7 +14,7 @@ defmodule CameraControl.TcpStream do
       {:ok, socket} ->
         Logger.info("TCP server started for camera #{id} on port #{port}")
         send(self(), :accept)
-        {:ok, %{id: id, socket: socket, clients: []}}
+        {:ok, %{id: id, socket: socket}}
 
       {:error, reason} ->
         {:stop, reason}
@@ -28,7 +28,7 @@ defmodule CameraControl.TcpStream do
         pid = spawn(fn -> client_loop(client, state.id) end)
         :ok = :gen_tcp.controlling_process(client, pid)
         send(self(), :accept)
-        {:noreply, %{state | clients: [pid | state.clients]}}
+        {:noreply, state}
 
       {:error, :timeout} ->
         send(self(), :accept)
@@ -44,23 +44,38 @@ defmodule CameraControl.TcpStream do
     CameraControl.subscribe(id)
     stream_loop(client)
   after
-    CameraControl.unsubscribe(id)
+    try do
+      CameraControl.unsubscribe(id)
+    catch
+      _, _ -> :ok
+    end
     :gen_tcp.close(client)
   end
 
   defp stream_loop(client) do
+    Process.sleep(1000)
+
+    frame_data = drain_latest_frame(nil)
+
+    if frame_data do
+      header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: #{byte_size(frame_data)}\r\n\r\n"
+      case :gen_tcp.send(client, [header, frame_data, "\r\n"]) do
+        :ok ->
+          stream_loop(client)
+        {:error, _} ->
+          :ok
+      end
+    else
+      stream_loop(client)
+    end
+  end
+
+  defp drain_latest_frame(latest) do
     receive do
       {:jpeg_frame, _id, frame_data} ->
-        header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: #{byte_size(frame_data)}\r\n\r\n"
-        case :gen_tcp.send(client, [header, frame_data, "\r\n"]) do
-          :ok ->
-            Process.sleep(1000) # Throttling for TCP stream (simulating 1FPS as python)
-            stream_loop(client)
-          {:error, _} ->
-            :ok
-        end
-      _ ->
-        stream_loop(client)
+        drain_latest_frame(frame_data)
+    after
+      0 -> latest
     end
   end
 end

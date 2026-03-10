@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <ctype.h>
 
 typedef struct {
     int camera_id;
@@ -32,7 +33,8 @@ typedef struct {
     double prev_error;
     int current_exp_time_us;
     int current_gain_x;
-    gint64 last_time_ns;
+    gint64 last_time_us;
+    ErlNifMutex *lock;
 } CameraState;
 
 static ErlNifResourceType* camera_state_type = NULL;
@@ -74,6 +76,19 @@ static GstFlowReturn on_new_jpeg_sample(GstAppSink *sink, gpointer user_data) {
     return GST_FLOW_OK;
 }
 
+static int is_usb_camera(const char *card_type) {
+    if (strlen(card_type) == 0) return 0;
+    char card_lower[64];
+    size_t len = strlen(card_type);
+    if (len >= sizeof(card_lower)) len = sizeof(card_lower) - 1;
+    for (size_t i = 0; i < len; i++) {
+        card_lower[i] = tolower((unsigned char)card_type[i]);
+    }
+    card_lower[len] = '\0';
+    return (strstr(card_lower, "usb live camera") != NULL ||
+            strstr(card_lower, "gbx usb live") != NULL);
+}
+
 static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
     CameraState *state = (CameraState *)user_data;
     GstSample *sample = gst_app_sink_pull_sample(sink);
@@ -82,18 +97,20 @@ static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
     GstBuffer *buffer = gst_sample_get_buffer(sample);
     GstMapInfo map;
     if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-        // Calculate mean intensity
         double sum = 0;
         for (gsize i = 0; i < map.size; i++) {
             sum += map.data[i];
         }
         double mean_intensity = sum / map.size;
-        
-        // PID Calculation
-        gint64 current_time_ns = g_get_monotonic_time();
-        double dt = (current_time_ns - state->last_time_ns) / 1e9;
+
+        // g_get_monotonic_time() returns microseconds (gint64)
+        gint64 current_time_us = g_get_monotonic_time();
+
+        enif_mutex_lock(state->lock);
+
+        double dt = (current_time_us - state->last_time_us) / 1e6;
         if (dt <= 0) dt = 0.001;
-        state->last_time_ns = current_time_ns;
+        state->last_time_us = current_time_us;
 
         double intensity = 255.0 * state->target_intensity;
         double error = intensity - mean_intensity;
@@ -102,26 +119,24 @@ static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
         double max_integral = 500.0;
 
         double P = Kp * error;
-        
+
         state->pid_integral += error * dt;
         if (state->pid_integral > max_integral) state->pid_integral = max_integral;
         if (state->pid_integral < -max_integral) state->pid_integral = -max_integral;
         double I = Ki * state->pid_integral;
-        
+
         double derivative_error = (error - state->prev_error) / dt;
         double D = Kd * derivative_error;
-        
+
         double control_output = P + I + D;
         double scaled_output = 1.0 + control_output * output_scale;
-        
+
         int new_exp_time = (int)(state->current_exp_time_us * scaled_output);
         state->prev_error = error;
-        
-        // Clamp exposure
+
         if (new_exp_time > state->max_exp_time_us) new_exp_time = state->max_exp_time_us;
         if (new_exp_time < state->min_exp_time_us) new_exp_time = state->min_exp_time_us;
-        
-        // Update gain
+
         int new_gain = state->current_gain_x;
         if (new_exp_time > state->inc_gain_exp_us) {
             new_gain += state->gain_change_step;
@@ -130,46 +145,51 @@ static GstFlowReturn on_new_gray_sample(GstAppSink *sink, gpointer user_data) {
             new_gain -= state->gain_change_step;
             if (new_gain < state->min_gain) new_gain = state->min_gain;
         }
-        
-        // Apply controls via ioctl
-        if (new_exp_time != state->current_exp_time_us) {
-            state->current_exp_time_us = new_exp_time;
-            int exp_to_apply = new_exp_time;
-            
-            // Convert card_type to lowercase for comparison, similar to Python
-            char card_lower[64];
-            int is_usb_cam = 0;
-            if (strlen(state->card_type) > 0) {
-                for (size_t i = 0; state->card_type[i]; i++) {
-                    card_lower[i] = tolower((unsigned char)state->card_type[i]);
-                }
-                card_lower[strlen(state->card_type)] = '\0';
-                
-                if (strstr(card_lower, "usb live camera") != NULL || 
-                    strstr(card_lower, "gbx usb live") != NULL) {
-                    is_usb_cam = 1;
-                }
-            }
 
-            if (is_usb_cam) {
-                exp_to_apply = new_exp_time / 9.5;
+        int apply_exp = (new_exp_time != state->current_exp_time_us);
+        int apply_gain = (new_gain != state->current_gain_x);
+        state->current_exp_time_us = new_exp_time;
+        state->current_gain_x = new_gain;
+
+        enif_mutex_unlock(state->lock);
+
+        if (apply_exp) {
+            int exp_to_apply;
+            if (is_usb_camera(state->card_type)) {
+                exp_to_apply = (int)(new_exp_time / 9.5);
             } else {
-                exp_to_apply = (new_exp_time / 1000.0) / 0.1;
+                exp_to_apply = (int)((new_exp_time / 1000.0) / 0.1);
             }
-            
-            // Note: V4L2_CID_EXPOSURE_ABSOLUTE = 0x009a0902
             set_v4l2_ctrl(state->fd, V4L2_CID_EXPOSURE_ABSOLUTE, exp_to_apply);
         }
-        
-        if (new_gain != state->current_gain_x) {
-            state->current_gain_x = new_gain;
+
+        if (apply_gain) {
             set_v4l2_ctrl(state->fd, V4L2_CID_GAIN, new_gain);
+        }
+
+        {
+            ErlNifEnv *msg_env = enif_alloc_env();
+            ERL_NIF_TERM msg = enif_make_tuple5(msg_env,
+                enif_make_atom(msg_env, "ae_data"),
+                enif_make_int(msg_env, state->camera_id),
+                enif_make_int(msg_env, new_exp_time),
+                enif_make_int(msg_env, new_gain),
+                enif_make_double(msg_env, mean_intensity));
+            enif_send(NULL, &state->target_pid, msg_env, msg);
+            enif_free_env(msg_env);
         }
 
         gst_buffer_unmap(buffer, &map);
     }
     gst_sample_unref(sample);
     return GST_FLOW_OK;
+}
+
+static void safe_strncpy(char *dst, const char *src, size_t dst_size) {
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
 }
 
 static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -194,29 +214,15 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
 
     CameraState *state = enif_alloc_resource(camera_state_type, sizeof(CameraState));
     memset(state, 0, sizeof(CameraState));
-    
+
     state->camera_id = camera_id;
-    strncpy(state->board_id, board_id, sizeof(state->board_id));
-    strncpy(state->camera_path, camera_path, sizeof(state->camera_path));
-    strncpy(state->card_type, card_type, sizeof(state->card_type));
+    safe_strncpy(state->board_id, board_id, sizeof(state->board_id));
+    safe_strncpy(state->camera_path, camera_path, sizeof(state->camera_path));
+    safe_strncpy(state->card_type, card_type, sizeof(state->card_type));
     state->target_pid = target_pid;
-    
-    // Check if USB camera for default values
-    char card_lower[64];
-    int is_usb = 0;
-    if (strlen(state->card_type) > 0) {
-        for (size_t i = 0; state->card_type[i]; i++) {
-            card_lower[i] = tolower((unsigned char)state->card_type[i]);
-        }
-        card_lower[strlen(state->card_type)] = '\0';
-        
-        if (strstr(card_lower, "usb live camera") != NULL || 
-            strstr(card_lower, "gbx usb live") != NULL) {
-            is_usb = 1;
-        }
-    }
-    
-    if (is_usb) {
+    state->lock = enif_mutex_create("camera_ae_lock");
+
+    if (is_usb_camera(state->card_type)) {
         state->target_intensity = 0.3;
         state->max_exp_time_us = 3000;
         state->min_exp_time_us = 100;
@@ -237,69 +243,107 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     }
     state->current_exp_time_us = 1400;
     state->current_gain_x = 1;
-    state->last_time_ns = g_get_monotonic_time();
-    
-    // Open FD for V4L2
+    state->last_time_us = g_get_monotonic_time();
+    state->fd = -1;
+
     state->fd = open(state->camera_path, O_RDWR);
     if (state->fd >= 0) {
-        // Set auto exposure to manual
         set_v4l2_ctrl(state->fd, V4L2_CID_EXPOSURE_AUTO, 1);
-        // Set power line frequency
         set_v4l2_ctrl(state->fd, V4L2_CID_POWER_LINE_FREQUENCY, 2);
-        // Set focus auto off
         set_v4l2_ctrl(state->fd, V4L2_CID_FOCUS_AUTO, 0);
     }
-    
+
     char pipeline_str[2048];
     if (strcmp(board_id, "rpi4") == 0) {
         snprintf(pipeline_str, sizeof(pipeline_str),
             "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
             "t. ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! gdppay ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! tcpserversink host=127.0.0.1 port=%d "
             "t. ! queue ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
-            "t. ! queue ! videorate ! video/x-raw,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
+            "t. ! queue ! videorate ! image/jpeg,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
             camera_path, fw, fh, fps, 5000 + camera_id);
     } else {
         snprintf(pipeline_str, sizeof(pipeline_str),
             "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
             "t. ! queue max-size-buffers=200 max-size-bytes=52428800 max-size-time=5000000000 leaky=downstream ! gdppay ! queue max-size-buffers=200 leaky=downstream ! tcpserversink host=127.0.0.1 port=%d sync-method=latest-keyframe recover-policy=keyframe "
             "t. ! queue max-size-buffers=2 leaky=downstream ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
-            "t. ! queue max-size-buffers=2 leaky=downstream ! videorate ! video/x-raw,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
+            "t. ! queue max-size-buffers=2 leaky=downstream ! videorate ! image/jpeg,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
             camera_path, fw, fh, fps, 5000 + camera_id);
     }
-        
+
     GError *error = NULL;
     state->pipeline = gst_parse_launch(pipeline_str, &error);
     if (error) {
-        g_printerr("Failed to parse pipeline: %s\n", error->message);
+        fprintf(stderr, "Failed to parse pipeline: %s\n", error->message);
         g_error_free(error);
+        if (state->fd >= 0) close(state->fd);
+        enif_mutex_destroy(state->lock);
         enif_release_resource(state);
-        return enif_make_tuple2(env, enif_make_atom(env, "error"), enif_make_string(env, "pipeline_parse_error", ERL_NIF_LATIN1));
+        return enif_make_tuple2(env, enif_make_atom(env, "error"),
+            enif_make_string(env, "pipeline_parse_error", ERL_NIF_LATIN1));
     }
-    
+
     GstElement *jpeg_sink = gst_bin_get_by_name(GST_BIN(state->pipeline), "jpeg_sink");
     gst_app_sink_set_emit_signals(GST_APP_SINK(jpeg_sink), TRUE);
     g_signal_connect(jpeg_sink, "new-sample", G_CALLBACK(on_new_jpeg_sample), state);
-    
+    gst_object_unref(jpeg_sink);
+
     GstElement *gray_sink = gst_bin_get_by_name(GST_BIN(state->pipeline), "gray_sink");
     gst_app_sink_set_emit_signals(GST_APP_SINK(gray_sink), TRUE);
     g_signal_connect(gray_sink, "new-sample", G_CALLBACK(on_new_gray_sample), state);
-    
+    gst_object_unref(gray_sink);
+
     gst_element_set_state(state->pipeline, GST_STATE_PLAYING);
-    
+
     ERL_NIF_TERM resource_term = enif_make_resource(env, state);
     enif_release_resource(state);
-    
+
     return enif_make_tuple2(env, enif_make_atom(env, "ok"), resource_term);
 }
 
-static ERL_NIF_TERM stop_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    if (argc != 1) return enif_make_badarg(env);
-    
+static ERL_NIF_TERM set_controls(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    if (argc != 9) return enif_make_badarg(env);
+
     CameraState *state;
     if (!enif_get_resource(env, argv[0], camera_state_type, (void**)&state)) {
         return enif_make_badarg(env);
     }
-    
+
+    double target_intensity;
+    int max_exp, min_exp, max_g, min_g, gain_step, dec_g, inc_g;
+
+    if (!enif_get_double(env, argv[1], &target_intensity) ||
+        !enif_get_int(env, argv[2], &max_exp) ||
+        !enif_get_int(env, argv[3], &min_exp) ||
+        !enif_get_int(env, argv[4], &max_g) ||
+        !enif_get_int(env, argv[5], &min_g) ||
+        !enif_get_int(env, argv[6], &gain_step) ||
+        !enif_get_int(env, argv[7], &dec_g) ||
+        !enif_get_int(env, argv[8], &inc_g)) {
+        return enif_make_badarg(env);
+    }
+
+    enif_mutex_lock(state->lock);
+    state->target_intensity = target_intensity;
+    state->max_exp_time_us = max_exp;
+    state->min_exp_time_us = min_exp;
+    state->max_gain = max_g;
+    state->min_gain = min_g;
+    state->gain_change_step = gain_step;
+    state->dec_gain_exp_us = dec_g;
+    state->inc_gain_exp_us = inc_g;
+    enif_mutex_unlock(state->lock);
+
+    return enif_make_atom(env, "ok");
+}
+
+static ERL_NIF_TERM stop_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    if (argc != 1) return enif_make_badarg(env);
+
+    CameraState *state;
+    if (!enif_get_resource(env, argv[0], camera_state_type, (void**)&state)) {
+        return enif_make_badarg(env);
+    }
+
     if (state->pipeline) {
         gst_element_send_event(state->pipeline, gst_event_new_eos());
         gst_element_set_state(state->pipeline, GST_STATE_NULL);
@@ -310,7 +354,7 @@ static ERL_NIF_TERM stop_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
         close(state->fd);
         state->fd = -1;
     }
-    
+
     return enif_make_atom(env, "ok");
 }
 
@@ -319,9 +363,15 @@ static void camera_state_dtor(ErlNifEnv* env, void* obj) {
     if (state->pipeline) {
         gst_element_set_state(state->pipeline, GST_STATE_NULL);
         gst_object_unref(state->pipeline);
+        state->pipeline = NULL;
     }
     if (state->fd >= 0) {
         close(state->fd);
+        state->fd = -1;
+    }
+    if (state->lock) {
+        enif_mutex_destroy(state->lock);
+        state->lock = NULL;
     }
 }
 
@@ -336,8 +386,9 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
 }
 
 static ErlNifFunc nif_funcs[] = {
-    {"start_camera", 8, start_camera, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"stop_camera", 1, stop_camera, ERL_NIF_DIRTY_JOB_IO_BOUND}
+    {"nif_start_camera", 8, start_camera, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"stop_camera", 1, stop_camera, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_controls", 9, set_controls, 0}
 };
 
 ERL_NIF_INIT(Elixir.CameraControl.Nif, nif_funcs, load, NULL, NULL, NULL)

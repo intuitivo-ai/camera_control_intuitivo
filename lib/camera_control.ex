@@ -5,7 +5,15 @@ defmodule CameraControl do
   alias CameraControl.Nif
 
   @enforce_keys [:id, :board_id]
-  defstruct [:id, :board_id, :path, :card_type, :width, :height, :fps, :resource, :frame, :device_inode, :last_frame_time, subscribers: []]
+  defstruct [
+    :id, :board_id, :path, :card_type, :width, :height, :fps,
+    :resource, :frame, :device_inode, :last_frame_time,
+    subscribers: [],
+    recording: false,
+    recording_base: nil,
+    exposure_data: [],
+    exposure_counter: 0
+  ]
 
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
@@ -25,6 +33,19 @@ defmodule CameraControl do
 
   def get_current_frame(id) do
     GenServer.call(via_tuple(id), :get_frame)
+  end
+
+  def set_controls(id, target_intensity, max_exp, min_exp, max_gain, min_gain, gain_step, dec_gain, inc_gain) do
+    GenServer.call(via_tuple(id), {:set_controls, target_intensity, max_exp, min_exp, max_gain, min_gain, gain_step, dec_gain, inc_gain})
+  end
+
+  def start_recording(id, file_location) do
+    base = file_location |> String.split("/raw/") |> List.first()
+    GenServer.cast(via_tuple(id), {:start_recording, base})
+  end
+
+  def stop_recording(id) do
+    GenServer.cast(via_tuple(id), :stop_recording)
   end
 
   @impl true
@@ -93,17 +114,48 @@ defmodule CameraControl do
   end
 
   @impl true
+  def handle_call({:set_controls, target_intensity, max_exp, min_exp, max_gain, min_gain, gain_step, dec_gain, inc_gain}, _from, state) do
+    result = Nif.set_controls(state.resource, target_intensity / 1.0, max_exp, min_exp, max_gain, min_gain, gain_step, dec_gain, inc_gain)
+    {:reply, result, state}
+  end
+
+  @impl true
   def handle_cast({:unsubscribe, pid}, state) do
     {:noreply, %{state | subscribers: List.delete(state.subscribers, pid)}}
   end
 
   @impl true
+  def handle_cast({:start_recording, base}, state) do
+    metadata_dir = Path.join(base, "metadata")
+    File.mkdir_p(metadata_dir)
+    {:noreply, %{state | recording: true, recording_base: base, exposure_data: [], exposure_counter: 0}}
+  end
+
+  @impl true
+  def handle_cast(:stop_recording, state) do
+    if state.recording and state.recording_base do
+      save_exposure_log(state)
+    end
+    {:noreply, %{state | recording: false, recording_base: nil, exposure_data: [], exposure_counter: 0}}
+  end
+
+  @impl true
   def handle_info({:jpeg_frame, id, frame_data}, %{id: id} = state) do
-    # Broadcoast frame to all subscribers
     Enum.each(state.subscribers, fn pid ->
       send(pid, {:jpeg_frame, id, frame_data})
     end)
     {:noreply, %{state | frame: frame_data, last_frame_time: System.monotonic_time(:millisecond)}}
+  end
+
+  @impl true
+  def handle_info({:ae_data, id, exp_time, gain, mean_intensity}, %{id: id} = state) do
+    if state.recording do
+      counter = state.exposure_counter + 1
+      entry = {counter, exp_time, gain, mean_intensity}
+      {:noreply, %{state | exposure_data: [entry | state.exposure_data], exposure_counter: counter}}
+    else
+      {:noreply, state}
+    end
   end
 
   @impl true
@@ -138,9 +190,30 @@ defmodule CameraControl do
     {:noreply, %{state | subscribers: List.delete(state.subscribers, pid)}}
   end
 
+  defp save_exposure_log(state) do
+    path = Path.join([state.recording_base, "metadata", "exposure_gain_cam#{state.id}.txt"])
+
+    content =
+      state.exposure_data
+      |> Enum.reverse()
+      |> Enum.map(fn {counter, exp, gain, mean} ->
+        "#{counter},#{exp},#{gain},#{Float.round(mean * 1.0, 4)}"
+      end)
+      |> Enum.join("\n")
+
+    case File.write(path, content <> "\n") do
+      :ok -> Logger.info("Exposure log saved to #{path}")
+      {:error, reason} -> Logger.error("Error saving exposure log: #{inspect(reason)}")
+    end
+  end
+
   @impl true
-  def terminate(_reason, %{resource: resource}) when not is_nil(resource) do
+  def terminate(reason, %{resource: resource} = state) when not is_nil(resource) do
+    if state.recording and state.recording_base do
+      save_exposure_log(state)
+    end
     Nif.stop_camera(resource)
+    Logger.info("Camera #{state.id} terminated: #{inspect(reason)}")
   end
   def terminate(_reason, _state), do: :ok
 end

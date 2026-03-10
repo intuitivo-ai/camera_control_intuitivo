@@ -44,45 +44,44 @@ defmodule CameraControl.DeviceFinder do
 
   defp parse_v4l2_output(output, targets) do
     lines = String.split(output, "\n")
-    
-    # We iterate over lines. When we find a line with a target identifier, 
-    # the next line with /dev/video is the device path.
+
     Enum.reduce_while(lines, false, fn line, matched ->
+      trimmed = String.trim(line)
+
       cond do
-        String.trim(line) == "" ->
+        trimmed == "" ->
           {:cont, matched}
-          
+
         not String.starts_with?(line, "\t") and not String.starts_with?(line, " ") ->
-          # It's a device header
           is_match = Enum.any?(targets, &String.contains?(line, &1))
           {:cont, is_match}
-          
-          matched and String.contains?(line, "/dev/video") ->
-          path = String.trim(line)
-          
-          # Get Card type for this device
-          card_type = case System.cmd("v4l2-ctl", ["--all", "--device", path]) do
-            {info_output, 0} ->
-              info_output
-              |> String.split("\n")
-              |> Enum.find(fn l -> String.contains?(l, "Card type") end)
-              |> case do
-                nil -> ""
-                card_line -> 
-                  [_, val] = String.split(card_line, ":")
-                  String.trim(val)
-              end
-            _ -> ""
-          end
+
+        matched and String.contains?(line, "/dev/video") ->
+          path = trimmed
+
+          card_type =
+            case System.cmd("v4l2-ctl", ["--all", "--device", path]) do
+              {info_output, 0} ->
+                info_output
+                |> String.split("\n")
+                |> Enum.find_value("", fn l ->
+                  if String.contains?(l, "Card type") do
+                    l |> String.split(":", parts: 2) |> List.last() |> String.trim()
+                  end
+                end)
+
+              _ ->
+                ""
+            end
 
           {:halt, {path, card_type}}
-          
+
         true ->
           {:cont, matched}
       end
     end)
     |> case do
-      path when is_binary(path) -> path
+      {path, card_type} when is_binary(path) -> {path, card_type}
       _ -> nil
     end
   end
