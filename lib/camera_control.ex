@@ -83,12 +83,12 @@ defmodule CameraControl do
     crash_count = recent_crash_count(id)
 
     if crash_count >= @max_rapid_crashes do
-      Logger.error("Camera #{id}: #{crash_count} crashes in #{div(@crash_window_ms, 1000)}s. Giving up.")
+      Logger.error("Camera #{id}: too many crashes (#{crash_count}/#{@max_rapid_crashes}), giving up")
       {:stop, :normal}
     else
       if crash_count > 0 do
         backoff = min(@max_backoff_ms, @base_backoff_ms * round(:math.pow(2, min(crash_count - 1, 4))))
-        Logger.info("Camera #{id}: backoff #{backoff}ms after #{crash_count} recent crash(es)")
+        Logger.info("Camera #{id}: waiting #{div(backoff, 1000)}s before retry (crash #{crash_count}/#{@max_rapid_crashes})")
         Process.sleep(backoff)
       end
 
@@ -96,7 +96,7 @@ defmodule CameraControl do
 
       cond do
         is_nil(path) ->
-          Logger.error("Failed to find device path for camera #{id} after #{@device_max_retries} retries")
+          Logger.warning("Camera #{id}: device not found after #{@device_max_retries} attempts")
           record_crash(id)
           {:stop, :device_not_found}
 
@@ -266,27 +266,25 @@ defmodule CameraControl do
 
   defp wait_device_ready(path, id, attempts) do
     case System.cmd("v4l2-ctl", ["--device", path, "--get-fmt-video"], stderr_to_stdout: true) do
-      {_output, 0} ->
-        true
-
+      {_output, 0} -> true
       _ ->
-        Logger.info("Camera #{id}: #{path} not ready, waiting 500ms (#{attempts - 1} left)...")
         Process.sleep(500)
         wait_device_ready(path, id, attempts - 1)
     end
   end
 
-  defp find_device_with_retries(_id, _board_id, 0), do: {nil, ""}
+  defp find_device_with_retries(id, board_id, max_retries) do
+    do_find_device(id, board_id, max_retries)
+  end
 
-  defp find_device_with_retries(id, board_id, retries_left) do
+  defp do_find_device(_id, _board_id, 0), do: {nil, ""}
+
+  defp do_find_device(id, board_id, retries_left) do
     case CameraControl.DeviceFinder.get_device_path(id, board_id) do
-      {p, c} ->
-        {p, c}
-
+      {p, c} -> {p, c}
       _ ->
-        Logger.info("Camera #{id}: device not found, retrying in #{@device_retry_delay_ms}ms (#{retries_left - 1} left)...")
         Process.sleep(@device_retry_delay_ms)
-        find_device_with_retries(id, board_id, retries_left - 1)
+        do_find_device(id, board_id, retries_left - 1)
     end
   end
 

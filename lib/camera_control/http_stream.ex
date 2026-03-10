@@ -1,15 +1,31 @@
 defmodule CameraControl.HttpStream do
   @moduledoc """
   Plug that serves MJPEG stream from a Camera Control instance at ~1 FPS.
+
+  Supports two URL patterns:
+  - `/` serves the camera configured via `:camera_id` plug option (for per-port instances)
+  - `/camera/{id}` serves any camera by ID (for shared-port usage)
   """
   import Plug.Conn
   require Logger
 
   def init(opts), do: opts
 
+  def call(%Plug.Conn{path_info: []} = conn, opts) do
+    id = Keyword.get(opts, :camera_id, 0)
+    serve_camera(conn, id)
+  end
+
   def call(%Plug.Conn{path_info: ["camera", id_str]} = conn, _opts) do
     id = String.to_integer(id_str)
+    serve_camera(conn, id)
+  end
 
+  def call(conn, _opts) do
+    send_resp(conn, 404, "Not Found")
+  end
+
+  defp serve_camera(conn, id) do
     conn =
       conn
       |> put_resp_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -30,10 +46,6 @@ defmodule CameraControl.HttpStream do
         end
         conn
     end
-  end
-
-  def call(conn, _opts) do
-    send_resp(conn, 404, "Not Found")
   end
 
   defp stream_loop(conn, id) do

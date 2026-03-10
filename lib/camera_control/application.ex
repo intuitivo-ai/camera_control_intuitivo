@@ -11,7 +11,7 @@ defmodule CameraControl.Application do
       {DynamicSupervisor, name: CameraControl.CameraSup1, strategy: :one_for_one, max_restarts: 20, max_seconds: 120},
       {DynamicSupervisor, name: CameraControl.CameraSup2, strategy: :one_for_one, max_restarts: 20, max_seconds: 120},
       {DynamicSupervisor, name: CameraControl.TcpSupervisor, strategy: :one_for_one},
-      {Bandit, plug: CameraControl.HttpStream, port: 11000}
+      {DynamicSupervisor, name: CameraControl.HttpSupervisor, strategy: :one_for_one}
     ]
 
     opts = [strategy: :one_for_one, name: CameraControl.AppSupervisor]
