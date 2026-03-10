@@ -41,7 +41,9 @@ ifneq ($(CROSSCOMPILE),)
 LDFLAGS := $(filter-out -dynamiclib,$(LDFLAGS))
 endif
 
-PRIV_DIR = priv
+# MIX_APP_PATH is set by elixir_make and points to _build/<env>/lib/camera_control
+# When building as a dependency, the .so must end up there so the runtime finds it.
+PRIV_DIR = $(MIX_APP_PATH)/priv
 SRC_DIR = c_src
 NIF_SO = $(PRIV_DIR)/camera_nif.so
 
