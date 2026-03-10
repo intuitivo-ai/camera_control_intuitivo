@@ -24,3 +24,7 @@ camera_control-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+
+# NIF build artifacts (platform-specific, do not commit)
+/c_src/*.o
+/priv/*.so

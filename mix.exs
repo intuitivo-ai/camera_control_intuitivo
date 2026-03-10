@@ -10,8 +10,21 @@ defmodule CameraControl.MixProject do
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_targets: ["all"],
       make_clean: ["clean"],
+      make_env: make_env(),
       deps: deps()
     ]
+  end
+
+  # When building as a Nerves dependency (rpi4_dev, opcm4_dev, etc.), ensure
+  # the Makefile gets CROSSCOMPILE=1 so it uses the Nerves toolchain.
+  defp make_env do
+    case to_string(Mix.env()) do
+      env when env in ["rpi4_dev", "rpi4_prod", "opcm4_dev", "opcm4_prod"] ->
+        %{"CROSSCOMPILE" => "1"}
+
+      _ ->
+        %{}
+    end
   end
 
   # Run "mix help compile.app" to learn about applications.
