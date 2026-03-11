@@ -86,8 +86,8 @@ defmodule CameraControl do
     crash_count = recent_crash_count(id)
 
     if crash_count >= @max_rapid_crashes do
-      Logger.error("Camera #{id}: too many crashes (#{crash_count}/#{@max_rapid_crashes}), giving up")
-      {:stop, :normal}
+      Logger.error("Camera #{id}: too many crashes (#{crash_count}/#{@max_rapid_crashes}), giving up to StatusReporter")
+      :ignore
     else
       if crash_count > 0 do
         backoff = min(@max_backoff_ms, @base_backoff_ms * round(:math.pow(2, min(crash_count - 1, 4))))
@@ -99,14 +99,14 @@ defmodule CameraControl do
 
       cond do
         is_nil(path) ->
+          # We don't throttle here anymore because returning :ignore stops the process
+          # and StatusReporter handles the periodic retry/logging
           Logger.warning("Camera #{id}: device not found after #{@device_max_retries} attempts")
-          record_crash(id)
-          {:stop, :device_not_found}
+          :ignore
 
         not wait_device_ready(path, id) ->
-          Logger.error("Camera #{id}: device #{path} never became ready")
-          record_crash(id)
-          {:stop, :device_not_ready}
+          Logger.warning("Camera #{id}: device #{path} not ready, will retry via StatusReporter")
+          :ignore
 
         true ->
           width = Keyword.get(opts, :width, 1280)

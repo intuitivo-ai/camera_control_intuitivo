@@ -236,12 +236,12 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     state->last_time_us = g_get_monotonic_time();
 
     char pipeline_str[2048];
-    if (strcmp(board_id, "rpi4") == 0) {
+    if (strcmp(board_id, "rpi4") == 0 && !is_usb_camera(state->card_type)) {
         snprintf(pipeline_str, sizeof(pipeline_str),
             "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
-            "t. ! queue max-size-buffers=200 max-size-bytes=52428800 max-size-time=5000000000 leaky=downstream ! gdppay ! queue max-size-buffers=200 leaky=downstream ! tcpserversink host=127.0.0.1 port=%d sync-method=latest-keyframe recover-policy=keyframe "
-            "t. ! queue max-size-buffers=2 leaky=downstream ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
-            "t. ! queue max-size-buffers=2 leaky=downstream ! videorate ! image/jpeg,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
+            "t. ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! gdppay ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! tcpserversink host=127.0.0.1 port=%d "
+            "t. ! queue ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
+            "t. ! queue ! videorate ! image/jpeg,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
             camera_path, fw, fh, fps, 5000 + camera_id);
     } else {
         snprintf(pipeline_str, sizeof(pipeline_str),
