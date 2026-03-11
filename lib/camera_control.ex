@@ -24,6 +24,9 @@ defmodule CameraControl do
   @max_backoff_ms 30_000
   @max_rapid_crashes 8
   @crash_window_ms 120_000
+  @first_frame_timeout_ms 20_000
+  @frame_timeout_ms 8_000
+  @post_teardown_delay_ms 1_000
 
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
@@ -220,28 +223,32 @@ defmodule CameraControl do
   def handle_info(:watchdog_check, state) do
     current_time = System.monotonic_time(:millisecond)
     time_since_last_frame = current_time - state.last_frame_time
+    timeout = if state.controls_initialized, do: @frame_timeout_ms, else: @first_frame_timeout_ms
 
-    # Increase timeout to 8000ms. Some cameras take longer to negotiate UVC
-    # and start streaming their first frame after being opened by GStreamer.
-    if time_since_last_frame > 12000 do
+    if time_since_last_frame > timeout do
       Logger.error("CameraControl watchdog: frame timeout on camera #{state.id}. Restarting.")
-      # Exit with an error tuple so the :transient supervisor restarts us
-      exit({:shutdown, :frame_timeout})
+      {:stop, {:watchdog, :frame_timeout}, state}
     else
       case File.stat(state.path) do
         {:ok, stat} ->
           if stat.inode != state.device_inode do
             Logger.error("CameraControl watchdog: device inode changed on camera #{state.id}. Restarting.")
-            exit({:shutdown, :device_changed})
+            {:stop, {:watchdog, :device_changed}, state}
           else
-            Process.send_after(self(), :watchdog_check, 1000)
+            Process.send_after(self(), :watchdog_check, 2000)
             {:noreply, state}
           end
         _ ->
           Logger.error("CameraControl watchdog: device gone on camera #{state.id}. Restarting.")
-          exit({:shutdown, :device_gone})
+          {:stop, {:watchdog, :device_gone}, state}
       end
     end
+  end
+
+  @impl true
+  def handle_info({:pipeline_error, id, message}, %{id: id} = state) do
+    Logger.error("Camera #{id}: GStreamer pipeline error: #{message}")
+    {:stop, {:watchdog, :pipeline_error}, state}
   end
 
   @impl true
@@ -348,6 +355,7 @@ defmodule CameraControl do
       save_exposure_log(state)
     end
     Nif.stop_camera(resource)
+    Process.sleep(@post_teardown_delay_ms)
     record_crash(state.id)
     Logger.info("Camera #{state.id} terminated: #{inspect(reason)}")
   end

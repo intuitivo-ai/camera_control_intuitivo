@@ -87,17 +87,23 @@ defmodule CameraControl.StatusReporter do
           last_attempt = Map.get(acc, id, 0)
 
           if now - last_attempt > @recovery_cooldown_ms do
-            Logger.info("StatusReporter: attempting recovery for camera #{id}")
-            CameraControl.reset_crash_count(id)
-
             opts = Map.get(state.camera_opts, id, [id: id, board_id: "rpi4"])
+            board_id = Keyword.get(opts, :board_id, "rpi4")
 
-            case CameraControl.Supervisor.start_camera(opts) do
-              {:ok, _} ->
-                Logger.info("StatusReporter: camera #{id} restart initiated")
+            case CameraControl.DeviceFinder.get_device_path(id, board_id) do
+              {_path, _card_type} ->
+                Logger.info("StatusReporter: attempting recovery for camera #{id}")
+                CameraControl.reset_crash_count(id)
 
-              {:error, reason} ->
-                Logger.warning("StatusReporter: camera #{id} restart failed: #{inspect(reason)}")
+                case CameraControl.Supervisor.start_camera(opts) do
+                  {:ok, _} ->
+                    Logger.info("StatusReporter: camera #{id} restart initiated")
+                  {:error, reason} ->
+                    Logger.warning("StatusReporter: camera #{id} restart failed: #{inspect(reason)}")
+                end
+
+              _ ->
+                Logger.debug("StatusReporter: camera #{id} device not found, skipping recovery")
             end
 
             Map.put(acc, id, now)

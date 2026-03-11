@@ -161,6 +161,27 @@ static void safe_strncpy(char *dst, const char *src, size_t dst_size) {
     dst[len] = '\0';
 }
 
+static GstBusSyncReply bus_sync_handler(GstBus *bus, GstMessage *msg, gpointer user_data) {
+    (void)bus;
+    CameraState *state = (CameraState *)user_data;
+
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError *err = NULL;
+        gst_message_parse_error(msg, &err, NULL);
+
+        ErlNifEnv *env = enif_alloc_env();
+        ERL_NIF_TERM msg_term = enif_make_tuple3(env,
+            enif_make_atom(env, "pipeline_error"),
+            enif_make_int(env, state->camera_id),
+            enif_make_string(env, err ? err->message : "unknown", ERL_NIF_LATIN1));
+        enif_send(NULL, &state->target_pid, env, msg_term);
+        enif_free_env(env);
+
+        if (err) g_error_free(err);
+    }
+    return GST_BUS_PASS;
+}
+
 static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     if (argc != 8) return enif_make_badarg(env);
 
@@ -218,9 +239,9 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     if (strcmp(board_id, "rpi4") == 0) {
         snprintf(pipeline_str, sizeof(pipeline_str),
             "v4l2src device=%s io-mode=2 ! image/jpeg,width=%d,height=%d,framerate=%d/1 ! tee name=t "
-            "t. ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! gdppay ! queue max-size-buffers=600 max-size-bytes=104857600 max-size-time=6000000000 ! tcpserversink host=127.0.0.1 port=%d "
-            "t. ! queue ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
-            "t. ! queue ! videorate ! image/jpeg,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
+            "t. ! queue max-size-buffers=200 max-size-bytes=52428800 max-size-time=5000000000 leaky=downstream ! gdppay ! queue max-size-buffers=200 leaky=downstream ! tcpserversink host=127.0.0.1 port=%d sync-method=latest-keyframe recover-policy=keyframe "
+            "t. ! queue max-size-buffers=2 leaky=downstream ! appsink name=jpeg_sink drop=true max-buffers=2 sync=false "
+            "t. ! queue max-size-buffers=2 leaky=downstream ! videorate ! image/jpeg,framerate=4/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=gray_sink drop=true max-buffers=1 sync=false",
             camera_path, fw, fh, fps, 5000 + camera_id);
     } else {
         snprintf(pipeline_str, sizeof(pipeline_str),
@@ -252,9 +273,15 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     g_signal_connect(gray_sink, "new-sample", G_CALLBACK(on_new_gray_sample), state);
     gst_object_unref(gray_sink);
 
+    GstBus *bus = gst_element_get_bus(state->pipeline);
+    gst_bus_set_sync_handler(bus, bus_sync_handler, state, NULL);
+    gst_object_unref(bus);
+
     GstStateChangeReturn ret = gst_element_set_state(state->pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         fprintf(stderr, "Camera %d: pipeline failed to start\n", camera_id);
+        gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        gst_element_get_state(state->pipeline, NULL, NULL, 5 * GST_SECOND);
         gst_object_unref(state->pipeline);
         state->pipeline = NULL;
         enif_mutex_destroy(state->lock);
@@ -263,7 +290,20 @@ static ERL_NIF_TERM start_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
             enif_make_string(env, "pipeline_start_failed", ERL_NIF_LATIN1));
     }
 
-    gst_element_get_state(state->pipeline, NULL, NULL, 2 * GST_SECOND);
+    GstState actual_state;
+    GstStateChangeReturn state_ret = gst_element_get_state(state->pipeline, &actual_state, NULL, 5 * GST_SECOND);
+    if (state_ret == GST_STATE_CHANGE_FAILURE || actual_state != GST_STATE_PLAYING) {
+        fprintf(stderr, "Camera %d: pipeline did not reach PLAYING (state=%d, ret=%d)\n",
+                camera_id, actual_state, state_ret);
+        gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        gst_element_get_state(state->pipeline, NULL, NULL, 5 * GST_SECOND);
+        gst_object_unref(state->pipeline);
+        state->pipeline = NULL;
+        enif_mutex_destroy(state->lock);
+        enif_release_resource(state);
+        return enif_make_tuple2(env, enif_make_atom(env, "error"),
+            enif_make_string(env, "pipeline_not_playing", ERL_NIF_LATIN1));
+    }
 
     ERL_NIF_TERM resource_term = enif_make_resource(env, state);
     enif_release_resource(state);
@@ -316,8 +356,8 @@ static ERL_NIF_TERM stop_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     }
 
     if (state->pipeline) {
-        gst_element_send_event(state->pipeline, gst_event_new_eos());
         gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        gst_element_get_state(state->pipeline, NULL, NULL, 5 * GST_SECOND);
         gst_object_unref(state->pipeline);
         state->pipeline = NULL;
     }
@@ -326,9 +366,11 @@ static ERL_NIF_TERM stop_camera(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 }
 
 static void camera_state_dtor(ErlNifEnv* env, void* obj) {
+    (void)env;
     CameraState *state = (CameraState *)obj;
     if (state->pipeline) {
         gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        gst_element_get_state(state->pipeline, NULL, NULL, 3 * GST_SECOND);
         gst_object_unref(state->pipeline);
         state->pipeline = NULL;
     }
@@ -339,6 +381,8 @@ static void camera_state_dtor(ErlNifEnv* env, void* obj) {
 }
 
 static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
+    (void)priv_data;
+    (void)load_info;
     gst_init(NULL, NULL);
     
     ErlNifResourceFlags flags = (ErlNifResourceFlags)(ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
