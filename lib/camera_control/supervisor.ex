@@ -23,6 +23,9 @@ defmodule CameraControl.Supervisor do
   end
 
   def start_tcp_server(opts) do
+    id = Keyword.fetch!(opts, :id)
+    ensure_jpeg_reader(id)
+
     DynamicSupervisor.start_child(
       CameraControl.TcpSupervisor,
       {CameraControl.TcpStream, opts}
@@ -35,6 +38,13 @@ defmodule CameraControl.Supervisor do
         DynamicSupervisor.terminate_child(CameraControl.TcpSupervisor, pid)
       _ ->
         :ok
+    end
+
+    # Stop JPEG reader only if HTTP isn't also using it
+    http_children = DynamicSupervisor.which_children(CameraControl.HttpSupervisor)
+
+    unless length(http_children) > 0 do
+      CameraControl.JpegFrameReader.stop(id)
     end
   end
 
@@ -58,6 +68,10 @@ defmodule CameraControl.Supervisor do
     # Explicitly bind to 0.0.0.0 so it's accessible from outside, just like Python's ('0.0.0.0', PORT)
     opts = Keyword.merge([plug: {CameraControl.HttpStream, [camera_id: camera_id]}, port: port, ip: {0, 0, 0, 0}], scheme_opts)
 
+    # Start JPEG frame reader to feed CameraControl GenServer with {:jpeg_frame} messages.
+    # HttpStream/TcpStream subscribe to CameraControl and need these frames.
+    ensure_jpeg_reader(camera_id)
+
     case DynamicSupervisor.start_child(
            CameraControl.HttpSupervisor,
            {Bandit, opts}
@@ -79,11 +93,49 @@ defmodule CameraControl.Supervisor do
   end
 
   def stop_all_http do
+    # Stop JPEG frame readers first (only if no TCP servers are using them)
+    Enum.each(0..2, fn id ->
+      tcp_alive = case Registry.lookup(CameraControl.Registry, "tcp_#{id}") do
+        [{_, _}] -> true
+        _ -> false
+      end
+
+      unless tcp_alive do
+        CameraControl.JpegFrameReader.stop(id)
+      end
+    end)
+
     DynamicSupervisor.which_children(CameraControl.HttpSupervisor)
     |> Enum.each(fn {_, pid, _, _} ->
       DynamicSupervisor.terminate_child(CameraControl.HttpSupervisor, pid)
     end)
 
     :ok
+  end
+
+  @doc """
+  Ensures a JpegFrameReader is running for the given camera.
+  No-op if already started or if the camera GenServer isn't alive.
+  Called by start_http_server and start_tcp_server.
+  """
+  def ensure_jpeg_reader(camera_id) do
+    case Registry.lookup(CameraControl.Registry, "jpeg_reader_#{camera_id}") do
+      [{_, _}] ->
+        # Already running
+        :ok
+
+      _ ->
+        target_pid = CameraControl.via_tuple(camera_id) |> GenServer.whereis()
+
+        if target_pid do
+          case CameraControl.JpegFrameReader.start_link(camera_id: camera_id, target_pid: target_pid) do
+            {:ok, _} -> :ok
+            {:error, {:already_started, _}} -> :ok
+            error -> error
+          end
+        else
+          :ok
+        end
+    end
   end
 end
