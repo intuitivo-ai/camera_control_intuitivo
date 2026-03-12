@@ -4,6 +4,7 @@ defmodule CameraControl.Application do
   @impl true
   def start(_type, _args) do
     :ets.new(:camera_crash_tracker, [:named_table, :public, :set])
+    :ets.new(:gst_pid_tracker, [:named_table, :public, :bag])
 
     children = [
       {Registry, keys: :unique, name: CameraControl.Registry},

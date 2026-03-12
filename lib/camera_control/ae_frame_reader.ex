@@ -37,6 +37,13 @@ defmodule CameraControl.AeFrameReader do
   def init(opts) do
     camera_id = Keyword.fetch!(opts, :camera_id)
     target_pid = Keyword.fetch!(opts, :target_pid)
+
+    # Ensure terminate/2 runs even when parent crashes
+    Process.flag(:trap_exit, true)
+
+    # Kill any orphaned ae_reader gst-launch from a previous run
+    CameraControl.PidTracker.kill_all(camera_id, :ae_reader)
+
     tcp_port = 5000 + camera_id
 
     pipeline =
@@ -58,6 +65,7 @@ defmodule CameraControl.AeFrameReader do
     )
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)
+    CameraControl.PidTracker.register(camera_id, :ae_reader, os_pid)
 
     Logger.info("AeFrameReader camera #{camera_id}: started (tcp port #{tcp_port}, #{@analysis_width}x#{@analysis_height} GRAY8 @ 4fps)")
 
@@ -82,8 +90,16 @@ defmodule CameraControl.AeFrameReader do
     {:stop, {:pipeline_exit, status}, %{state | port: nil}}
   end
 
+  # Handle EXIT from linked parent (AutoExposure) — stop cleanly
+  @impl true
+  def handle_info({:EXIT, _pid, reason}, state) do
+    {:stop, reason, state}
+  end
+
   @impl true
   def terminate(_reason, state) do
+    if state.os_pid, do: System.cmd("kill", ["-SIGINT", "#{state.os_pid}"], stderr_to_stdout: true)
+
     if state.port do
       try do
         Port.close(state.port)
@@ -91,6 +107,8 @@ defmodule CameraControl.AeFrameReader do
         _, _ -> :ok
       end
     end
+
+    CameraControl.PidTracker.unregister(state.camera_id, :ae_reader)
   end
 
   defp extract_frames(buffer, state) when byte_size(buffer) >= @frame_size do

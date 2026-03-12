@@ -55,6 +55,12 @@ defmodule CameraControl.GstPipelineRunner do
     fps = Keyword.get(opts, :fps, 30)
     target_pid = Keyword.get(opts, :target_pid)
 
+    # Ensure terminate/2 runs even when parent crashes (sends SIGINT to gst-launch)
+    Process.flag(:trap_exit, true)
+
+    # Kill any orphaned gst-launch from a previous run of this camera
+    CameraControl.PidTracker.kill_all(camera_id, :pipeline)
+
     tcp_port = 5000 + camera_id
 
     pipeline = build_pipeline(path, width, height, fps, tcp_port)
@@ -75,8 +81,10 @@ defmodule CameraControl.GstPipelineRunner do
       ]
     )
 
-    # Get the OS pid so we can kill it on cleanup
+    # Get the OS pid so we can kill it on cleanup.
+    # With `exec`, sh is replaced by gst-launch-1.0 so os_pid IS the gst-launch PID.
     {:os_pid, os_pid} = Port.info(port, :os_pid)
+    CameraControl.PidTracker.register(camera_id, :pipeline, os_pid)
 
     state = %__MODULE__{
       camera_id: camera_id,
@@ -130,12 +138,18 @@ defmodule CameraControl.GstPipelineRunner do
     {:stop, {:pipeline_exit, status}, %{state | status: :stopped, port: nil}}
   end
 
+  # Handle EXIT from linked parent (camera GenServer) — stop cleanly
+  @impl true
+  def handle_info({:EXIT, _pid, reason}, state) do
+    {:stop, reason, state}
+  end
+
   @impl true
   def terminate(_reason, state) do
+    # SIGINT triggers clean EOS shutdown in gst-launch-1.0 -e
+    if state.os_pid, do: System.cmd("kill", ["-SIGINT", "#{state.os_pid}"], stderr_to_stdout: true)
+
     if state.port do
-      # Port.close sends SIGHUP to the process group.
-      # With "exec gst-launch-1.0", the gst-launch process IS the shell process,
-      # so it receives the signal directly and shuts down.
       try do
         Port.close(state.port)
       catch
@@ -143,6 +157,7 @@ defmodule CameraControl.GstPipelineRunner do
       end
     end
 
+    CameraControl.PidTracker.unregister(state.camera_id, :pipeline)
     Logger.info("GstPipelineRunner camera #{state.camera_id}: terminated")
   end
 
