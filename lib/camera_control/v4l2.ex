@@ -5,12 +5,14 @@ defmodule CameraControl.V4L2 do
   """
   require Logger
 
-  @usb_camera_identifiers ["usb live camera", "gbx usb live"]
+  @usb_camera_identifiers ["usb live camera", "gbx usb live", "arducam"]
 
   def init_controls(path, board_id, card_type) do
-    set_ctrl(path, auto_exposure_name(board_id), 1)
-    set_ctrl(path, "power_line_frequency", 2)
-    set_focus_auto(path, board_id, card_type)
+    supported = list_controls(path)
+
+    set_ctrl_if_supported(path, supported, auto_exposure_name(board_id), 1)
+    set_ctrl_if_supported(path, supported, "power_line_frequency", 2)
+    set_focus_auto(path, board_id, card_type, supported)
 
     if usb_camera?(card_type) do
       set_defaults_usb(path, board_id)
@@ -34,6 +36,23 @@ defmodule CameraControl.V4L2 do
     set_ctrl(path, "gain", gain)
   end
 
+  defp list_controls(path) do
+    case System.cmd("v4l2-ctl", ["--device", path, "--list-ctrls-menus"], stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, _} -> output
+    end
+  rescue
+    _ -> ""
+  end
+
+  defp set_ctrl_if_supported(path, supported, name, value) do
+    if String.contains?(supported, name) do
+      set_ctrl(path, name, value)
+    else
+      Logger.debug("V4L2: control #{name} not supported on #{path}, skipping")
+    end
+  end
+
   defp set_ctrl(path, name, value) do
     System.cmd("v4l2-ctl", [
       "--device", path,
@@ -43,14 +62,14 @@ defmodule CameraControl.V4L2 do
     _ -> :ok
   end
 
-  defp set_focus_auto(path, "rpi4", card_type) do
+  defp set_focus_auto(path, "rpi4", card_type, supported) do
     if usb_camera?(card_type) do
-      set_ctrl(path, "focus_automatic_continuous", 0)
+      set_ctrl_if_supported(path, supported, "focus_automatic_continuous", 0)
     end
   end
 
-  defp set_focus_auto(path, _board_id, _card_type) do
-    set_ctrl(path, "focus_auto", 0)
+  defp set_focus_auto(path, _board_id, _card_type, supported) do
+    set_ctrl_if_supported(path, supported, "focus_auto", 0)
   end
 
   defp auto_exposure_name("opcm4"), do: "exposure_auto"

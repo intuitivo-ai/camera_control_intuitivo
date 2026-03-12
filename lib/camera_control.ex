@@ -2,20 +2,19 @@ defmodule CameraControl do
   use GenServer
   require Logger
 
-  alias CameraControl.Nif
+  alias CameraControl.GstPipelineRunner
 
   @enforce_keys [:id, :board_id]
   defstruct [
     :id, :board_id, :path, :card_type, :width, :height, :fps,
-    :resource, :frame, :device_inode, :last_frame_time,
+    :pipeline_pid, :frame, :device_inode, :last_frame_time,
     subscribers: [],
     recording: false,
     recording_base: nil,
     exposure_data: [],
     exposure_counter: 0,
     last_applied_exp: 0,
-    last_applied_gain: -1,
-    controls_initialized: false
+    last_applied_gain: -1
   ]
 
   @device_retry_delay_ms 2_000
@@ -24,9 +23,7 @@ defmodule CameraControl do
   @max_backoff_ms 30_000
   @max_rapid_crashes 8
   @crash_window_ms 120_000
-  @first_frame_timeout_ms 20_000
-  @frame_timeout_ms 8_000
-  @post_teardown_delay_ms 1_000
+  @heartbeat_interval_ms 2_000
 
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
@@ -99,8 +96,6 @@ defmodule CameraControl do
 
       cond do
         is_nil(path) ->
-          # We don't throttle here anymore because returning :ignore stops the process
-          # and StatusReporter handles the periodic retry/logging
           Logger.warning("Camera #{id}: device not found after #{@device_max_retries} attempts")
           :ignore
 
@@ -118,10 +113,30 @@ defmodule CameraControl do
             _ -> nil
           end
 
-          case Nif.start_camera(id, board_id, path, card_type, width, height, fps, self()) do
-            {:ok, resource} ->
+          # Launch GStreamer pipeline in a separate OS process
+          pipeline_opts = [
+            camera_id: id,
+            path: path,
+            card_type: card_type,
+            board_id: board_id,
+            width: width,
+            height: height,
+            fps: fps,
+            target_pid: self()
+          ]
+
+          case GstPipelineRunner.start_link(pipeline_opts) do
+            {:ok, pipeline_pid} ->
+              Process.monitor(pipeline_pid)
               Logger.info("Camera #{id} started successfully at #{path} (#{card_type})")
+              clear_crash_history_on_success(id)
+
+              # Initialize V4L2 controls now that device is confirmed working
+              CameraControl.V4L2.init_controls(path, board_id, card_type)
+
+              # Start watchdog and heartbeat
               Process.send_after(self(), :watchdog_check, 4000)
+              Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
 
               {:ok, %__MODULE__{
                 id: id,
@@ -131,7 +146,7 @@ defmodule CameraControl do
                 width: width,
                 height: height,
                 fps: fps,
-                resource: resource,
+                pipeline_pid: pipeline_pid,
                 device_inode: inode,
                 last_frame_time: System.monotonic_time(:millisecond)
               }}
@@ -158,13 +173,15 @@ defmodule CameraControl do
 
   @impl true
   def handle_call(:alive?, _from, state) do
-    {:reply, state.resource != nil, state}
+    {:reply, state.pipeline_pid != nil, state}
   end
 
   @impl true
-  def handle_call({:set_controls, target_intensity, max_exp, min_exp, max_gain, min_gain, gain_step, dec_gain, inc_gain}, _from, state) do
-    result = Nif.set_controls(state.resource, target_intensity / 1.0, max_exp, min_exp, max_gain, min_gain, gain_step, dec_gain, inc_gain)
-    {:reply, result, state}
+  def handle_call({:set_controls, _ti, _max_e, _min_e, _max_g, _min_g, _gs, _dec_g, _inc_g}, _from, state) do
+    # AE controls are applied directly via V4L2 (v4l2-ctl), not via NIF anymore.
+    # The NIF set_controls was for the C-side PID controller which is no longer used
+    # in the separate-process architecture. Controls are stored and applied via V4L2.
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -188,87 +205,59 @@ defmodule CameraControl do
   end
 
   @impl true
+  def handle_info(:heartbeat, state) do
+    # Periodic heartbeat — schedule next one
+    Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info({:jpeg_frame, id, frame_data}, %{id: id} = state) do
     Enum.each(state.subscribers, fn pid ->
       send(pid, {:jpeg_frame, id, frame_data})
     end)
 
-    state =
-      if not state.controls_initialized do
-        Logger.info("Camera #{id}: first frame received, initializing V4L2 controls")
-        CameraControl.V4L2.init_controls(state.path, state.board_id, state.card_type)
-        %{state | controls_initialized: true}
-      else
-        state
-      end
-
-    clear_crash_history_on_success(id)
     {:noreply, %{state | frame: frame_data, last_frame_time: System.monotonic_time(:millisecond)}}
   end
 
   @impl true
-  def handle_info({:ae_data, id, exp_time, gain, mean_intensity}, %{id: id} = state) do
-    state = apply_ae_controls(state, exp_time, gain)
+  def handle_info({:pipeline_started, id}, %{id: id} = state) do
+    Logger.info("Camera #{id}: GStreamer pipeline running in separate process")
+    {:noreply, state}
+  end
 
-    if state.recording do
-      counter = state.exposure_counter + 1
-      entry = {counter, exp_time, gain, mean_intensity}
-      {:noreply, %{state | exposure_data: [entry | state.exposure_data], exposure_counter: counter}}
-    else
-      {:noreply, state}
-    end
+  @impl true
+  def handle_info({:pipeline_crashed, id, exit_status}, %{id: id} = state) do
+    Logger.error("Camera #{id}: GStreamer pipeline process crashed (exit #{exit_status})")
+    {:stop, {:pipeline_crashed, exit_status}, %{state | pipeline_pid: nil}}
   end
 
   @impl true
   def handle_info(:watchdog_check, state) do
-    current_time = System.monotonic_time(:millisecond)
-    time_since_last_frame = current_time - state.last_frame_time
-    timeout = if state.controls_initialized, do: @frame_timeout_ms, else: @first_frame_timeout_ms
-
-    if time_since_last_frame > timeout do
-      Logger.error("CameraControl watchdog: frame timeout on camera #{state.id}. Restarting.")
-      {:stop, {:watchdog, :frame_timeout}, state}
-    else
-      case File.stat(state.path) do
-        {:ok, stat} ->
-          if stat.inode != state.device_inode do
-            Logger.error("CameraControl watchdog: device inode changed on camera #{state.id}. Restarting.")
-            {:stop, {:watchdog, :device_changed}, state}
-          else
-            Process.send_after(self(), :watchdog_check, 2000)
-            {:noreply, state}
-          end
-        _ ->
-          Logger.error("CameraControl watchdog: device gone on camera #{state.id}. Restarting.")
-          {:stop, {:watchdog, :device_gone}, state}
-      end
+    case File.stat(state.path) do
+      {:ok, stat} ->
+        if stat.inode != state.device_inode do
+          Logger.error("CameraControl watchdog: device inode changed on camera #{state.id}. Restarting.")
+          {:stop, {:watchdog, :device_changed}, state}
+        else
+          Process.send_after(self(), :watchdog_check, 2000)
+          {:noreply, state}
+        end
+      _ ->
+        Logger.error("CameraControl watchdog: device gone on camera #{state.id}. Restarting.")
+        {:stop, {:watchdog, :device_gone}, state}
     end
   end
 
   @impl true
-  def handle_info({:pipeline_error, id, message}, %{id: id} = state) do
-    Logger.error("Camera #{id}: GStreamer pipeline error: #{message}")
-    {:stop, {:watchdog, :pipeline_error}, state}
+  def handle_info({:DOWN, _ref, :process, pid, reason}, %{pipeline_pid: pid} = state) when pid != nil do
+    Logger.warning("Camera #{state.id}: pipeline runner process died: #{inspect(reason)}")
+    {:stop, {:pipeline_down, reason}, %{state | pipeline_pid: nil}}
   end
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     {:noreply, %{state | subscribers: List.delete(state.subscribers, pid)}}
-  end
-
-  defp apply_ae_controls(state, exp_time, gain) do
-    exp_changed = exp_time != state.last_applied_exp
-    gain_changed = gain != state.last_applied_gain
-
-    if exp_changed do
-      CameraControl.V4L2.apply_exposure(state.path, state.board_id, state.card_type, exp_time)
-    end
-
-    if gain_changed do
-      CameraControl.V4L2.apply_gain(state.path, state.board_id, gain)
-    end
-
-    %{state | last_applied_exp: exp_time, last_applied_gain: gain}
   end
 
   defp wait_device_ready(path, id, attempts \\ 5)
@@ -350,14 +339,17 @@ defmodule CameraControl do
   end
 
   @impl true
-  def terminate(reason, %{resource: resource} = state) when not is_nil(resource) do
+  def terminate(reason, state) do
     if state.recording and state.recording_base do
       save_exposure_log(state)
     end
-    Nif.stop_camera(resource)
-    Process.sleep(@post_teardown_delay_ms)
+
+    # Stop the pipeline runner process
+    if state.pipeline_pid && Process.alive?(state.pipeline_pid) do
+      GstPipelineRunner.stop(state.id)
+    end
+
     record_crash(state.id)
     Logger.info("Camera #{state.id} terminated: #{inspect(reason)}")
   end
-  def terminate(_reason, _state), do: :ok
 end
