@@ -3,18 +3,17 @@ defmodule CameraControl do
   require Logger
 
   alias CameraControl.GstPipelineRunner
+  alias CameraControl.AutoExposure
 
   @enforce_keys [:id, :board_id]
   defstruct [
     :id, :board_id, :path, :card_type, :width, :height, :fps,
-    :pipeline_pid, :frame, :device_inode, :last_frame_time,
+    :pipeline_pid, :ae_pid, :frame, :device_inode, :last_frame_time,
     subscribers: [],
     recording: false,
     recording_base: nil,
     exposure_data: [],
-    exposure_counter: 0,
-    last_applied_exp: 0,
-    last_applied_gain: -1
+    exposure_counter: 0
   ]
 
   @device_retry_delay_ms 2_000
@@ -177,10 +176,33 @@ defmodule CameraControl do
   end
 
   @impl true
-  def handle_call({:set_controls, _ti, _max_e, _min_e, _max_g, _min_g, _gs, _dec_g, _inc_g}, _from, state) do
-    # AE controls are applied directly via V4L2 (v4l2-ctl), not via NIF anymore.
-    # The NIF set_controls was for the C-side PID controller which is no longer used
-    # in the separate-process architecture. Controls are stored and applied via V4L2.
+  def handle_call({:set_controls, ti, max_e, min_e, max_g, min_g, gs, dec_g, inc_g}, _from, state) do
+    params = %{
+      target_intensity: ti,
+      max_exp_us: max_e,
+      min_exp_us: min_e,
+      max_gain: max_g,
+      min_gain: min_g,
+      gain_change_step: gs,
+      dec_gain_exp_us: dec_g,
+      inc_gain_exp_us: inc_g
+    }
+
+    # Start AutoExposure if not yet running, or update its params
+    state =
+      if state.ae_pid do
+        AutoExposure.update_controls(state.id, params)
+        state
+      else
+        case start_auto_exposure(state) do
+          {:ok, ae_pid} ->
+            AutoExposure.update_controls(state.id, params)
+            %{state | ae_pid: ae_pid}
+          _ ->
+            state
+        end
+      end
+
     {:reply, :ok, state}
   end
 
@@ -208,6 +230,20 @@ defmodule CameraControl do
   def handle_info(:heartbeat, state) do
     # Periodic heartbeat — schedule next one
     Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:ae_update, id, exp_us, gain, mean_intensity}, %{id: id} = state) do
+    state =
+      if state.recording do
+        counter = state.exposure_counter + 1
+        entry = {counter, exp_us, gain, mean_intensity}
+        %{state | exposure_data: [entry | state.exposure_data], exposure_counter: counter}
+      else
+        state
+      end
+
     {:noreply, state}
   end
 
@@ -250,6 +286,12 @@ defmodule CameraControl do
   end
 
   @impl true
+  def handle_info({:DOWN, _ref, :process, pid, reason}, %{ae_pid: pid} = state) when pid != nil do
+    Logger.warning("Camera #{state.id}: auto-exposure process died: #{inspect(reason)}, will restart on next set_controls")
+    {:noreply, %{state | ae_pid: nil}}
+  end
+
+  @impl true
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{pipeline_pid: pid} = state) when pid != nil do
     Logger.warning("Camera #{state.id}: pipeline runner process died: #{inspect(reason)}")
     {:stop, {:pipeline_down, reason}, %{state | pipeline_pid: nil}}
@@ -258,6 +300,27 @@ defmodule CameraControl do
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     {:noreply, %{state | subscribers: List.delete(state.subscribers, pid)}}
+  end
+
+  defp start_auto_exposure(state) do
+    ae_opts = [
+      camera_id: state.id,
+      device_path: state.path,
+      board_id: state.board_id,
+      card_type: state.card_type,
+      camera_pid: self()
+    ]
+
+    case AutoExposure.start_link(ae_opts) do
+      {:ok, pid} ->
+        Process.monitor(pid)
+        Logger.info("Camera #{state.id}: auto-exposure started")
+        {:ok, pid}
+
+      {:error, reason} ->
+        Logger.warning("Camera #{state.id}: failed to start auto-exposure: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   defp wait_device_ready(path, id, attempts \\ 5)
@@ -344,7 +407,9 @@ defmodule CameraControl do
       save_exposure_log(state)
     end
 
-    # Stop the pipeline runner process
+    # Stop auto-exposure and pipeline runner
+    if state.ae_pid, do: AutoExposure.stop(state.id)
+
     if state.pipeline_pid && Process.alive?(state.pipeline_pid) do
       GstPipelineRunner.stop(state.id)
     end
