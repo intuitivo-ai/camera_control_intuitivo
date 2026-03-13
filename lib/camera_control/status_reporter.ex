@@ -150,9 +150,15 @@ defmodule CameraControl.StatusReporter do
 
   def handle_info({:attempt_usb_recovery, _, _}, state), do: {:noreply, state}
 
-  # Re-start JpegFrameReader after camera recovery (delayed to let tcpserversink come up)
+  # Re-start JpegFrameReader after camera recovery, only if HTTP or TCP is active for this camera
   def handle_info({:ensure_jpeg_reader, camera_id}, %{active: true} = state) do
-    CameraControl.Supervisor.ensure_jpeg_reader(camera_id)
+    http_active = http_active_for_camera?(camera_id)
+    tcp_active = Registry.lookup(CameraControl.Registry, "tcp_#{camera_id}") != []
+
+    if http_active or tcp_active do
+      CameraControl.Supervisor.ensure_jpeg_reader(camera_id)
+    end
+
     {:noreply, state}
   end
 
@@ -279,6 +285,14 @@ defmodule CameraControl.StatusReporter do
     case Registry.lookup(CameraControl.Registry, "camera_#{id}") do
       [{_pid, _}] -> true
       _ -> false
+    end
+  end
+
+  defp http_active_for_camera?(camera_id) do
+    port = 11000 + camera_id
+    case :gen_tcp.connect(~c"127.0.0.1", port, [], 100) do
+      {:ok, socket} -> :gen_tcp.close(socket); true
+      {:error, _} -> false
     end
   end
 end
