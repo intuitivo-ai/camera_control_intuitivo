@@ -13,6 +13,8 @@ defmodule CameraControl.TcpStream do
 
   @impl true
   def init({id, port}) do
+    Process.flag(:trap_exit, true)
+
     case :gen_tcp.listen(port, [:binary, packet: :raw, active: false, reuseaddr: true]) do
       {:ok, socket} ->
         Logger.info("TCP server started for camera #{id} on port #{port}")
@@ -48,7 +50,6 @@ defmodule CameraControl.TcpStream do
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   defp client_loop(client, id) do
-    Process.flag(:trap_exit, true)
     CameraControl.subscribe(id)
     stream_loop(client, id, 0)
   after
