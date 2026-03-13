@@ -42,6 +42,7 @@ defmodule CameraControl.JpegFrameReader do
     target_pid = Keyword.fetch!(opts, :target_pid)
 
     Process.flag(:trap_exit, true)
+    Process.monitor(target_pid)
 
     CameraControl.PidTracker.kill_all(camera_id, :jpeg_reader)
 
@@ -83,6 +84,12 @@ defmodule CameraControl.JpegFrameReader do
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning("JpegFrameReader camera #{state.camera_id}: pipeline exited (status #{status})")
     {:stop, {:pipeline_exit, status}, %{state | port: nil}}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, reason}, %{target_pid: pid} = state) do
+    Logger.warning("JpegFrameReader camera #{state.camera_id}: target died: #{inspect(reason)}")
+    {:stop, {:target_down, reason}, state}
   end
 
   @impl true

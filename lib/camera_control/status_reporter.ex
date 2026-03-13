@@ -127,12 +127,14 @@ defmodule CameraControl.StatusReporter do
           case CameraControl.Supervisor.start_camera(opts) do
             {:ok, _} ->
               Logger.info("StatusReporter: camera #{camera_id} recovered via USB hotplug")
+              Process.send_after(self(), {:ensure_jpeg_reader, camera_id}, 3_000)
 
             :ignore ->
               Logger.warning("StatusReporter: camera #{camera_id} USB recovery returned :ignore")
 
             {:error, {:already_started, _}} ->
               Logger.info("StatusReporter: camera #{camera_id} already running")
+              Process.send_after(self(), {:ensure_jpeg_reader, camera_id}, 3_000)
 
             {:error, reason} ->
               Logger.warning("StatusReporter: camera #{camera_id} USB recovery failed: #{inspect(reason)}")
@@ -147,6 +149,14 @@ defmodule CameraControl.StatusReporter do
   end
 
   def handle_info({:attempt_usb_recovery, _, _}, state), do: {:noreply, state}
+
+  # Re-start JpegFrameReader after camera recovery (delayed to let tcpserversink come up)
+  def handle_info({:ensure_jpeg_reader, camera_id}, %{active: true} = state) do
+    CameraControl.Supervisor.ensure_jpeg_reader(camera_id)
+    {:noreply, state}
+  end
+
+  def handle_info({:ensure_jpeg_reader, _}, state), do: {:noreply, state}
 
   @impl true
   def handle_info(:check_status, %{active: false} = state) do
@@ -230,10 +240,12 @@ defmodule CameraControl.StatusReporter do
             case result do
               {:ok, _} ->
                 Logger.info("StatusReporter: camera #{id} restart initiated")
+                Process.send_after(self(), {:ensure_jpeg_reader, id}, 3_000)
               :ignore ->
                 Logger.warning("StatusReporter: camera #{id} init returned ignore (device not ready)")
               {:error, {:already_started, _}} ->
                 Logger.info("StatusReporter: camera #{id} already running")
+                Process.send_after(self(), {:ensure_jpeg_reader, id}, 3_000)
               {:error, reason} ->
                 Logger.warning("StatusReporter: camera #{id} restart failed: #{inspect(reason)}")
             end

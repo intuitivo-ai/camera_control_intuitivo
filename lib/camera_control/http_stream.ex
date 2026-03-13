@@ -17,8 +17,10 @@ defmodule CameraControl.HttpStream do
   end
 
   def call(%Plug.Conn{path_info: ["camera", id_str]} = conn, _opts) do
-    id = String.to_integer(id_str)
-    serve_camera(conn, id)
+    case Integer.parse(id_str) do
+      {id, ""} -> serve_camera(conn, id)
+      _ -> send_resp(conn, 400, "Invalid camera ID")
+    end
   end
 
   def call(conn, _opts) do
@@ -48,7 +50,18 @@ defmodule CameraControl.HttpStream do
     end
   end
 
-  defp stream_loop(conn, id) do
+  # Close connection after 30s without frames (camera likely dead)
+  @max_empty_cycles 30
+
+  defp stream_loop(conn, id, empty_cycles \\ 0)
+
+  defp stream_loop(conn, id, empty_cycles) when empty_cycles >= @max_empty_cycles do
+    Logger.warning("HttpStream camera #{id}: no frames for #{@max_empty_cycles}s, closing connection")
+    CameraControl.unsubscribe(id)
+    conn
+  end
+
+  defp stream_loop(conn, id, empty_cycles) do
     Process.sleep(1000)
 
     frame_data = drain_latest_frame(nil)
@@ -58,14 +71,14 @@ defmodule CameraControl.HttpStream do
 
       case Plug.Conn.chunk(conn, [header, frame_data, "\r\n"]) do
         {:ok, conn} ->
-          stream_loop(conn, id)
+          stream_loop(conn, id, 0)
 
         {:error, _reason} ->
           CameraControl.unsubscribe(id)
           conn
       end
     else
-      stream_loop(conn, id)
+      stream_loop(conn, id, empty_cycles + 1)
     end
   end
 

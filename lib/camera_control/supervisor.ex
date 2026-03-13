@@ -40,10 +40,11 @@ defmodule CameraControl.Supervisor do
         :ok
     end
 
-    # Stop JPEG reader only if HTTP isn't also using it
-    http_children = DynamicSupervisor.which_children(CameraControl.HttpSupervisor)
+    # Stop JPEG reader only if HTTP isn't also using it for this camera
+    http_port = 11000 + id
+    http_active = port_listening?(http_port)
 
-    unless length(http_children) > 0 do
+    unless http_active do
       CameraControl.JpegFrameReader.stop(id)
     end
   end
@@ -136,6 +137,16 @@ defmodule CameraControl.Supervisor do
         else
           :ok
         end
+    end
+  end
+
+  defp port_listening?(port) do
+    case :gen_tcp.connect(~c"127.0.0.1", port, [], 100) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        true
+      {:error, _} ->
+        false
     end
   end
 end

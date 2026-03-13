@@ -212,14 +212,13 @@ defmodule CameraControl.AutoExposure do
     }
   end
 
+  defp compute_mean_intensity(<<>>), do: 0.0
+
   defp compute_mean_intensity(frame_data) do
     size = byte_size(frame_data)
-    sum = sum_bytes(frame_data, 0)
+    sum = :erlang.binary_to_list(frame_data) |> :lists.sum()
     sum / size
   end
-
-  defp sum_bytes(<<>>, acc), do: acc
-  defp sum_bytes(<<b, rest::binary>>, acc), do: sum_bytes(rest, acc + b)
 
   defp compute_gain(new_exp_us, state) do
     cond do

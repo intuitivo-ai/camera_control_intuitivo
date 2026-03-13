@@ -2,6 +2,9 @@ defmodule CameraControl.TcpStream do
   use GenServer
   require Logger
 
+  # Close connection after 30s without frames (camera likely dead)
+  @max_empty_cycles 30
+
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
     port = Keyword.get(opts, :port, 6000 + id)
@@ -25,7 +28,7 @@ defmodule CameraControl.TcpStream do
   def handle_info(:accept, state) do
     case :gen_tcp.accept(state.socket, 1000) do
       {:ok, client} ->
-        pid = spawn(fn -> client_loop(client, state.id) end)
+        pid = spawn_link(fn -> client_loop(client, state.id) end)
         :ok = :gen_tcp.controlling_process(client, pid)
         send(self(), :accept)
         {:noreply, state}
@@ -40,9 +43,14 @@ defmodule CameraControl.TcpStream do
     end
   end
 
+  # Client processes exit when GenServer dies (spawn_link), ignore their exits
+  @impl true
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
   defp client_loop(client, id) do
+    Process.flag(:trap_exit, true)
     CameraControl.subscribe(id)
-    stream_loop(client)
+    stream_loop(client, id, 0)
   after
     try do
       CameraControl.unsubscribe(id)
@@ -52,7 +60,12 @@ defmodule CameraControl.TcpStream do
     :gen_tcp.close(client)
   end
 
-  defp stream_loop(client) do
+  defp stream_loop(_client, id, empty_cycles) when empty_cycles >= @max_empty_cycles do
+    Logger.warning("TcpStream camera #{id}: no frames for #{@max_empty_cycles}s, closing connection")
+    :ok
+  end
+
+  defp stream_loop(client, id, empty_cycles) do
     Process.sleep(1000)
 
     frame_data = drain_latest_frame(nil)
@@ -61,12 +74,12 @@ defmodule CameraControl.TcpStream do
       header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: #{byte_size(frame_data)}\r\n\r\n"
       case :gen_tcp.send(client, [header, frame_data, "\r\n"]) do
         :ok ->
-          stream_loop(client)
+          stream_loop(client, id, 0)
         {:error, _} ->
           :ok
       end
     else
-      stream_loop(client)
+      stream_loop(client, id, empty_cycles + 1)
     end
   end
 

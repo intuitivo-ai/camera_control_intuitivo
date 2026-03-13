@@ -40,6 +40,7 @@ defmodule CameraControl.AeFrameReader do
 
     # Ensure terminate/2 runs even when parent crashes
     Process.flag(:trap_exit, true)
+    Process.monitor(target_pid)
 
     # Kill any orphaned ae_reader gst-launch from a previous run
     CameraControl.PidTracker.kill_all(camera_id, :ae_reader)
@@ -90,6 +91,12 @@ defmodule CameraControl.AeFrameReader do
     {:stop, {:pipeline_exit, status}, %{state | port: nil}}
   end
 
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, reason}, %{target_pid: pid} = state) do
+    Logger.warning("AeFrameReader camera #{state.camera_id}: target died: #{inspect(reason)}")
+    {:stop, {:target_down, reason}, state}
+  end
+
   # Handle EXIT from linked parent (AutoExposure) — stop cleanly
   @impl true
   def handle_info({:EXIT, _pid, reason}, state) do
@@ -109,6 +116,12 @@ defmodule CameraControl.AeFrameReader do
     end
 
     CameraControl.PidTracker.unregister(state.camera_id, :ae_reader)
+  end
+
+  # Cap buffer at ~1MB to avoid unbounded growth if target is slow or dead
+  defp extract_frames(buffer, state) when byte_size(buffer) > 1_048_576 do
+    Logger.warning("AeFrameReader camera #{state.camera_id}: buffer overflow (#{byte_size(buffer)} bytes), resetting")
+    {<<>>, state}
   end
 
   defp extract_frames(buffer, state) when byte_size(buffer) >= @frame_size do
