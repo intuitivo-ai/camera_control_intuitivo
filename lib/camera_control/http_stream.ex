@@ -1,6 +1,6 @@
 defmodule CameraControl.HttpStream do
   @moduledoc """
-  Plug that serves MJPEG stream from a Camera Control instance at ~1 FPS.
+  Plug that serves MJPEG stream from a Camera Control instance at ~4 FPS.
 
   Supports two URL patterns:
   - `/` serves the camera configured via `:camera_id` plug option (for per-port instances)
@@ -50,19 +50,20 @@ defmodule CameraControl.HttpStream do
     end
   end
 
+  @frame_interval_ms 250
   # Close connection after 30s without frames (camera likely dead)
-  @max_empty_cycles 30
+  @max_empty_cycles div(30_000, @frame_interval_ms)
 
   defp stream_loop(conn, id, empty_cycles \\ 0)
 
   defp stream_loop(conn, id, empty_cycles) when empty_cycles >= @max_empty_cycles do
-    Logger.warning("HttpStream camera #{id}: no frames for #{@max_empty_cycles}s, closing connection")
+    Logger.warning("HttpStream camera #{id}: no frames for #{div(@max_empty_cycles * @frame_interval_ms, 1000)}s, closing connection")
     CameraControl.unsubscribe(id)
     conn
   end
 
   defp stream_loop(conn, id, empty_cycles) do
-    Process.sleep(1000)
+    Process.sleep(@frame_interval_ms)
 
     frame_data = drain_latest_frame(nil)
 
